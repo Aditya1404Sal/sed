@@ -1004,7 +1004,7 @@ pub fn process_line(
 }
 
 /// Mark all address ranges non-active (and 0-starting ones as active).
-fn reset_latched_address_ranges(range_commands: &mut [Rc<RefCell<Command>>]) {
+pub(crate) fn reset_latched_address_ranges(range_commands: &mut [Rc<RefCell<Command>>]) {
     for cmd_rc in range_commands.iter() {
         let mut cmd = cmd_rc.borrow_mut();
 

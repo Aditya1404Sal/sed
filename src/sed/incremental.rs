@@ -157,6 +157,8 @@ impl Engine {
     fn start(&mut self) -> UResult<()> {
         if !self.started {
             self.started = true;
+            // As at the start of the first file: pre-latch `0,/re/` ranges.
+            crate::sed::processor::reset_latched_address_ranges(&mut self.context.range_commands);
             crate::sed::processor::process_address_0(self.commands.clone(), &mut self.output)?;
         }
         Ok(())
@@ -234,6 +236,7 @@ mod tests {
         let (out, code) = run(&["2q5"], "a\nb\nc\n");
         assert_eq!((out.as_str(), code), ("a\nb\n", 5));
         assert_eq!(run(&["1!G;h;$!d"], "a\nb\n").0, "b\na\n");
+        assert_eq!(run(&["0,/b/d"], "a\nb\nc\n").0, "c\n");
     }
 
     #[test]

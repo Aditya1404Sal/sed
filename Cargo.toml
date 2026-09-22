@@ -62,7 +62,7 @@ sha2 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 tempfile = "3.10.1"
 terminal_size = "0.4.2"
 textwrap = { version = "0.16.1", features = ["terminal_size"] }
-uucore = { version = "0.12.0", features = ["libc"] }
+uucore = { version = "0.13.0", features = ["libc"] }
 rustix = "1.1.4"
 xattr = "1.3.1"
 
@@ -172,3 +172,7 @@ unnested_or_patterns = "allow"
 restriction = { level = "allow", priority = -1 }
 cognitive_complexity = "warn"
 redundant_clone = "warn"
+
+# uucore 0.13 with the WASI fixes, as used by the Golem bash tool.
+[patch.crates-io]
+uucore = { git = "https://github.com/Aditya1404Sal/coreutils", rev = "a21e94a48191232168a77798831a219f02d5bfbf" }

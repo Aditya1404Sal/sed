@@ -1957,13 +1957,7 @@ fn in_place_edit_backup() -> std::io::Result<()> {
     std::fs::write(&path, b"hello, world\n")?;
 
     new_ucmd!()
-        .args(&[
-            "-i",
-            ".bak",
-            "-e",
-            "s/world/universe/",
-            path.to_str().unwrap(),
-        ])
+        .args(&["-i.bak", "-e", "s/world/universe/", path.to_str().unwrap()])
         .succeeds();
 
     // Read edited file
@@ -2054,8 +2048,7 @@ fn in_place_edit_follow_symlink_with_backup() -> Result<(), Box<dyn std::error::
     new_ucmd!()
         .args(&[
             "--follow-symlinks",
-            "-i",
-            ".bak",
+            "-i.bak",
             "-e",
             "s/world/universe/",
             link.path().to_str().unwrap(),
@@ -2090,8 +2083,7 @@ fn in_place_edit_symlink_replaced_with_backup() -> Result<(), Box<dyn std::error
 
     new_ucmd!()
         .args(&[
-            "-i",
-            ".bak",
+            "-i.bak",
             "-e",
             "s/world/universe/",
             link.path().to_str().unwrap(),

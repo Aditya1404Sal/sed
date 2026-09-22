@@ -15,6 +15,7 @@ pub mod error_handling;
 pub mod fast_io;
 pub mod fast_regex;
 pub mod in_place;
+pub mod incremental;
 pub mod named_writer;
 pub mod processor;
 pub mod script_char_provider;
@@ -27,6 +28,7 @@ use crate::sed::script_line_provider::ScriptValue;
 use clap::{Arg, ArgMatches, Command, arg};
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use uucore::error::{UResult, USimpleError, UUsageError};
 use uucore::format_usage;
@@ -35,16 +37,60 @@ const ABOUT: &str = "Stream editor for filtering and transforming text (part of 
 const USAGE: &str = "sed [OPTION]... [script] [file]...";
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (uutils)");
 
+/// Rewrite GNU's attached in-place suffix (`-i.bak`, `-ni.bak`) as
+/// `--in-place=SUFFIX`: in a short-option cluster, `i` takes the rest of the
+/// cluster as its suffix, and never the following argument.
+pub fn normalize_in_place(args: impl uucore::Args) -> Vec<OsString> {
+    let mut normalized = Vec::new();
+    let mut options = true;
+    for arg in args {
+        let cluster = arg
+            .to_str()
+            .filter(|text| options && text.len() > 1 && text.starts_with('-'))
+            .filter(|text| !text.starts_with("--"))
+            .map(|text| text[1..].chars().collect::<Vec<_>>());
+        if arg == "--" {
+            options = false;
+        }
+        let Some(cluster) = cluster else {
+            normalized.push(arg);
+            continue;
+        };
+        // Letters after a value-taking option belong to its value.
+        let in_place = cluster
+            .iter()
+            .take_while(|c| !matches!(c, 'e' | 'f' | 'l'))
+            .position(|c| *c == 'i');
+        let Some(index) = in_place else {
+            normalized.push(arg);
+            continue;
+        };
+        let before: String = cluster[..index].iter().collect();
+        let suffix: String = cluster[index + 1..].iter().collect();
+        if !before.is_empty() {
+            normalized.push(format!("-{before}").into());
+        }
+        normalized.push(if suffix.is_empty() {
+            "--in-place".into()
+        } else {
+            format!("--in-place={suffix}").into()
+        });
+    }
+    normalized
+}
+
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let matches = uu_app().try_get_matches_from(args)?;
+    let matches = uu_app().try_get_matches_from(normalize_in_place(args))?;
 
     // Don't use arg_required_else_help when declaring command
     // as it exits with code 2 and we use it to check
     // default matches in tests.
     if !matches.args_present() {
         let _ = uu_app().print_help();
-        std::process::exit(1);
+        // Return rather than exit: embedders run sed inside their own process.
+        uucore::error::set_exit_code(1);
+        return Ok(());
     }
 
     let (scripts, files) = get_scripts_files(&matches)?;
@@ -105,6 +151,9 @@ pub fn uu_app() -> Command {
                 .long("in-place")
                 .help("Edit files in place, making a backup if SUFFIX is supplied.")
                 .num_args(0..=1)
+                // GNU form: the suffix must be attached (`-i.bak`, `--in-place=.bak`),
+                // so `-i SCRIPT` does not take the script as a suffix.
+                .require_equals(true)
                 .default_missing_value(""),
             // Access with .get_one::<u32>("line-length")
             arg!(-l --length <NUM> "Specify the 'l' command line-wrap length.")
@@ -246,6 +295,7 @@ fn build_context(matches: &ArgMatches) -> UResult<ProcessingContext> {
         posix: matches.get_flag("posix"),
         separate: matches.get_flag("separate"),
         sandbox: matches.get_flag("sandbox"),
+        no_exec: !cfg!(any(unix, windows)),
         unbuffered: matches.get_flag("unbuffered"),
         null_data: matches.get_flag("null-data"),
         uutil_extensions: matches.get_flag("uutil-extensions"),
@@ -374,7 +424,11 @@ mod tests {
 
     // build_context
     fn test_matches(args: &[&str]) -> ArgMatches {
-        uu_app().get_matches_from(["sed"].into_iter().chain(args.iter().copied()))
+        let args = ["sed"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(OsString::from);
+        uu_app().get_matches_from(normalize_in_place(args))
     }
 
     #[test]
@@ -445,11 +499,36 @@ mod tests {
 
     #[test]
     fn test_in_place_with_suffix() {
-        let matches = test_matches(&["-i", ".bak"]);
-        let ctx = build_context(&matches).unwrap();
+        // GNU form: the suffix is attached to the option.
+        for args in [&["-i.bak"][..], &["--in-place=.bak"][..]] {
+            let matches = test_matches(args);
+            let ctx = build_context(&matches).unwrap();
+            assert!(ctx.in_place);
+            assert_eq!(ctx.in_place_suffix, Some(".bak".to_string()));
+        }
+    }
 
+    #[test]
+    fn test_in_place_in_short_option_clusters() {
+        let matches = test_matches(&["-ni.orig", "p", "f"]);
+        let ctx = build_context(&matches).unwrap();
+        assert!(ctx.quiet && ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, Some(".orig".to_string()));
+        let matches = test_matches(&["-Ei", "s/(a)/b/", "f"]);
+        let ctx = build_context(&matches).unwrap();
+        assert!(ctx.regex_extended && ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, None);
+    }
+
+    #[test]
+    fn test_in_place_does_not_take_the_script_as_suffix() {
+        let matches = test_matches(&["-i", "s/a/b/", "file.txt"]);
+        let ctx = build_context(&matches).unwrap();
+        let (scripts, files) = get_scripts_files(&matches).unwrap();
         assert!(ctx.in_place);
-        assert_eq!(ctx.in_place_suffix, Some(".bak".to_string()));
+        assert_eq!(ctx.in_place_suffix, None);
+        assert_eq!(scripts, vec![ScriptValue::StringVal("s/a/b/".to_string())]);
+        assert_eq!(files, vec![PathBuf::from("file.txt")]);
     }
 
     #[test]

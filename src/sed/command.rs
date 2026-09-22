@@ -36,6 +36,9 @@ pub struct ProcessingContext {
     pub posix: bool,
     pub separate: bool,
     pub sandbox: bool,
+    /// Refuse the `e` command and the `s///e` flag: no shell is available
+    /// on this platform, or the embedder runs commands itself.
+    pub no_exec: bool,
     pub unbuffered: bool,
     pub null_data: bool,
     pub uutil_extensions: bool,
@@ -387,8 +390,9 @@ pub enum SpaceFlag {
 pub struct InputAction {
     /// Next command to execute (rather than commands from start)
     pub next_command: Option<Rc<RefCell<Command>>>,
-    /// Data to prepend to the read contents
-    pub prepend: Vec<u8>,
+    /// Data to prepend to the read contents (`N`); `None` replaces the
+    /// pattern space with the next line (`n`).
+    pub prepend: Option<Vec<u8>>,
 }
 
 #[cfg(test)]

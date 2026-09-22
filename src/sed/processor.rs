@@ -40,10 +40,31 @@ macro_rules! extract_variant {
     };
 }
 
+/// Answers whether the line just read is the last line of its input.
+pub trait LastLine {
+    /// Return true if the previously returned line was the last one.
+    fn last_line(&mut self) -> io::Result<bool>;
+}
+
+impl LastLine for LineReader<'_> {
+    fn last_line(&mut self) -> io::Result<bool> {
+        LineReader::last_line(self)
+    }
+}
+
+/// A last-line answer supplied by an embedder that delivers lines itself.
+pub struct KnownLast(pub bool);
+
+impl LastLine for KnownLast {
+    fn last_line(&mut self) -> io::Result<bool> {
+        Ok(self.0)
+    }
+}
+
 /// Return true if the passed address matches the current I/O context.
 fn match_address(
     addr: &Address,
-    reader: &mut LineReader,
+    reader: &mut dyn LastLine,
     pattern: &mut IOChunk,
     context: &mut ProcessingContext,
     location: &ScriptLocation,
@@ -75,7 +96,7 @@ fn match_address(
 /// Return true if the command applies to the given pattern.
 fn applies(
     command: &mut Command,
-    reader: &mut LineReader,
+    reader: &mut dyn LastLine,
     pattern: &mut IOChunk,
     context: &mut ProcessingContext,
 ) -> UResult<bool> {
@@ -214,9 +235,13 @@ fn shell_command(cmd: &OsStr) -> std::process::Command {
 }
 
 // Fallback if the target OS is neither Windows nor UNIX-like
+// Without a platform shell, spawning fails and is reported as a runtime error;
+// `no_exec` normally refuses such scripts at compile time.
 #[cfg(not(any(unix, windows)))]
-fn shell_command(_cmd: &OsStr) -> std::process::Command {
-    unimplemented!("the 'e' substitute flag requires a platform shell (/bin/sh or cmd.exe)");
+fn shell_command(cmd: &OsStr) -> std::process::Command {
+    let mut c = std::process::Command::new("/bin/sh");
+    c.arg("-c").arg(cmd);
+    c
 }
 
 /// Run the given command bytes in a shell, returning its raw standard
@@ -609,7 +634,7 @@ fn list(
 }
 
 /// Handle address 0 read at the beginning of each file.
-fn process_address_0(
+pub(crate) fn process_address_0(
     commands: Option<Rc<RefCell<Command>>>,
     output: &mut OutputBuffer,
 ) -> UResult<()> {
@@ -648,18 +673,56 @@ fn process_file(
     process_address_0(commands.clone(), output)?;
 
     // Loop over the input lines as pattern space.
-    'lines: while let Some(mut pattern) = reader.get_line()? {
+    while let Some(pattern) = reader.get_line()? {
+        process_line(commands.clone(), pattern, reader, output, context)?;
+        if context.stop_processing {
+            output.flush_pending_newline()?;
+            break;
+        }
+    }
+
+    // Handle any N command remains.
+    if context.separate
+        && !context.quiet
+        && let Some(InputAction {
+            prepend: Some(mut pending),
+            ..
+        }) = context.input_action.take()
+    {
+        pending.push(b'\n');
+        output.write_bytes(&pending)?;
+        if context.unbuffered {
+            output.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::cognitive_complexity)]
+/// Run one script cycle over a newly read input line: the commands, then
+/// the automatic print and queued appends. `n` and `N` park a continuation
+/// in `context.input_action` that the next line resumes.
+pub fn process_line(
+    commands: Option<Rc<RefCell<Command>>>,
+    mut pattern: IOChunk,
+    reader: &mut dyn LastLine,
+    output: &mut OutputBuffer,
+    context: &mut ProcessingContext,
+) -> UResult<()> {
+    {
         context.line_number += 1;
         context.substitution_made = false;
         // Set the script command from which to start.
         let mut current: Option<Rc<RefCell<Command>>> =
             if let Some(action) = context.input_action.take() {
-                // Continue processing the `N` command.
-                let mut combined_lines = action.prepend;
-                combined_lines.push(b'\n');
-                combined_lines.extend_from_slice(pattern.as_bytes());
-
-                pattern.set_to_bytes(combined_lines, pattern.is_newline_terminated());
+                if let Some(mut combined_lines) = action.prepend {
+                    // Continue processing the `N` command.
+                    combined_lines.push(b'\n');
+                    combined_lines.extend_from_slice(pattern.as_bytes());
+                    pattern.set_to_bytes(combined_lines, pattern.is_newline_terminated());
+                }
+                // `n` simply continues with the new line.
                 action.next_command
             } else {
                 // Start from the script top.
@@ -779,7 +842,20 @@ fn process_file(
                     list(output, &pattern, width, &command.location, context)?;
                 }
                 'n' => {
-                    break;
+                    // Without a next line GNU sed quits after the automatic print.
+                    if reader.last_line()? && context.last_file {
+                        context.stop_processing = true;
+                        break;
+                    }
+                    if !context.quiet {
+                        write_chunk(output, context, &pattern)?;
+                    }
+                    flush_appends(output, context)?;
+                    context.input_action = Some(InputAction {
+                        next_command: command.next.clone(),
+                        prepend: None,
+                    });
+                    return Ok(());
                 }
                 'N' => {
                     flush_appends(output, context)?;
@@ -789,9 +865,9 @@ fn process_file(
                     // to perform when the next line is read.
                     context.input_action = Some(InputAction {
                         next_command: command.next.clone(),
-                        prepend: pattern.as_bytes().to_vec(),
+                        prepend: Some(pattern.as_bytes().to_vec()),
                     });
-                    continue 'lines;
+                    return Ok(());
                 }
                 'p' => {
                     write_chunk(output, context, &pattern)?;
@@ -923,26 +999,7 @@ fn process_file(
         }
 
         flush_appends(output, context)?;
-
-        if context.stop_processing {
-            output.flush_pending_newline()?;
-            break;
-        }
     }
-
-    // Handle any N command remains.
-    if context.separate
-        && !context.quiet
-        && let Some(action) = context.input_action.take()
-    {
-        let mut pending = action.prepend;
-        pending.push(b'\n');
-        output.write_bytes(&pending)?;
-        if context.unbuffered {
-            output.flush()?;
-        }
-    }
-
     Ok(())
 }
 
@@ -994,9 +1051,11 @@ pub fn process_all_files(
         if context.last_file
             && !context.separate
             && !context.quiet
-            && let Some(action) = context.input_action.take()
+            && let Some(InputAction {
+                prepend: Some(mut pending),
+                ..
+            }) = context.input_action.take()
         {
-            let mut pending = action.prepend;
             pending.push(b'\n');
             output.write_bytes(&pending)?;
         }

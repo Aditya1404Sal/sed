@@ -210,6 +210,11 @@ impl<'a> IOChunk<'a> {
         }
     }
 
+    /// Construct an owned chunk from a line without its terminator.
+    pub fn from_bytes(content: Vec<u8>, has_newline: bool) -> Self {
+        Self::from_content(IOChunkContent::new_owned(content, has_newline))
+    }
+
     #[cfg(test)]
     /// Create an Owned newline-terminated IOChunk from a string.
     pub fn new_from_str(s: &str) -> Self {
@@ -585,11 +590,11 @@ struct MmapOutput {
 /// page cache.
 /// All other output is buffered and writen via BufWriter.
 pub struct OutputBuffer {
-    out: BufWriter<Box<dyn OutputWrite + 'static>>, // Where to write
+    out: BufWriter<Box<dyn Write + 'static>>, // Where to write
     #[cfg(unix)]
-    fast_copy: FastCopy,            // Data for fast file copy ops
+    fast_copy: FastCopy,      // Data for fast file copy ops
     #[cfg(unix)]
-    max_pending_write: usize,       // Max bytes to keep before flushing
+    max_pending_write: usize, // Max bytes to keep before flushing
     #[cfg(unix)]
     mmap_chunk: Option<MmapOutput>, // Chunk to write
     // True when the last write didn't end with \n; the \n is deferred so
@@ -627,6 +632,27 @@ impl OutputBuffer {
     pub fn new(w: Box<dyn OutputWrite + 'static>) -> Self {
         Self {
             out: BufWriter::new(w),
+            pending_newline: false,
+            #[cfg(test)]
+            low_level_flushes: 0,
+        }
+    }
+
+    /// Construct over any writer, such as an embedder's in-memory sink.
+    /// Such output never takes the zero-copy file paths.
+    pub fn from_writer(w: Box<dyn Write + 'static>) -> Self {
+        Self {
+            out: BufWriter::new(w),
+            #[cfg(unix)]
+            fast_copy: FastCopy {
+                fd: -1,
+                is_regular: false,
+                block_size: 4096,
+            },
+            #[cfg(unix)]
+            max_pending_write: MAX_PENDING_WRITE_NON_FILE,
+            #[cfg(unix)]
+            mmap_chunk: None,
             pending_newline: false,
             #[cfg(test)]
             low_level_flushes: 0,

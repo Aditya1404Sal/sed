@@ -1129,7 +1129,7 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "textwrap",
- "uucore",
+ "uucore 0.13.0",
  "uutests",
  "xattr",
 ]
@@ -1457,8 +1457,30 @@ dependencies = [
  "dns-lookup",
  "fluent",
  "fluent-syntax",
- "itertools 0.15.0",
  "jiff",
+ "libc",
+ "nix",
+ "os_display",
+ "rustc-hash",
+ "rustix",
+ "thiserror",
+ "time",
+ "unic-langid",
+ "unicode-width",
+ "uucore_procs 0.12.0",
+ "wild",
+ "windows-sys",
+]
+
+[[package]]
+name = "uucore"
+version = "0.13.0"
+source = "git+https://github.com/Aditya1404Sal/coreutils?rev=a21e94a48191232168a77798831a219f02d5bfbf#a21e94a48191232168a77798831a219f02d5bfbf"
+dependencies = [
+ "clap",
+ "fluent",
+ "fluent-syntax",
+ "itertools 0.15.0",
  "libc",
  "nix",
  "os_display",
@@ -1466,10 +1488,9 @@ dependencies = [
  "rustix",
  "tempfile",
  "thiserror",
- "time",
  "unic-langid",
  "unicode-width",
- "uucore_procs",
+ "uucore_procs 0.13.0",
  "wild",
  "windows-sys",
 ]
@@ -1479,6 +1500,15 @@ name = "uucore_procs"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50aa1f3bba55168888ae6f1f2714ce58897d8020d742d21f474f01e86468fedd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "uucore_procs"
+version = "0.13.0"
+source = "git+https://github.com/Aditya1404Sal/coreutils?rev=a21e94a48191232168a77798831a219f02d5bfbf#a21e94a48191232168a77798831a219f02d5bfbf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1498,7 +1528,7 @@ dependencies = [
  "regex",
  "rlimit",
  "tempfile",
- "uucore",
+ "uucore 0.12.0",
  "xattr",
 ]
 

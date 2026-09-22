@@ -35,6 +35,8 @@ const DEFAULT_OUTPUT_WIDTH: usize = 60;
 const ERR_ADDRESS_0_USAGE: &str =
     "address 0 can only be used with ~step, a second regular expression, or a read command";
 const ERR_SANDBOX: &str = "command not allowed with --sandbox";
+const ERR_NO_EXEC: &str =
+    "the 'e' command and substitute flag are unsupported here: no shell to run";
 
 const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to 's'";
 const ERR_TRANSLITERATION_LENGTH: &str = "transliteration strings are not the same length";
@@ -852,6 +854,9 @@ fn compile_subst_command(
 
     subst.replacement = compile_replacement(lines, line, context.character_mode)?;
     compile_subst_flags(lines, line, &mut subst, context.posix, context.sandbox)?;
+    if subst.execute && context.no_exec {
+        return compilation_error(lines, line, ERR_NO_EXEC);
+    }
 
     if pattern.is_empty() && (subst.ignore_case || subst.multiline) {
         return compilation_error(
@@ -1456,6 +1461,9 @@ fn compile_execute_command(
             line,
             "the 'e' command is not allowed with --posix or --sandbox",
         );
+    }
+    if context.no_exec {
+        return compilation_error(lines, line, ERR_NO_EXEC);
     }
 
     line.advance(); // Skip the command character.

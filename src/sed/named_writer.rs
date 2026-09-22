@@ -93,14 +93,14 @@ impl NamedWriter {
 }
 
 /// Flush buffered content to the file, returning descriptive errors.
+/// Flush and release every writer; a process that runs sed more than once
+/// (an embedding shell) must not keep earlier runs' files open.
 pub fn flush_all() -> UResult<()> {
-    FLUSH_LIST.with(|cell| {
-        for handle in cell.borrow().iter() {
-            handle.borrow_mut().flush()?;
-        }
-
-        Ok(())
-    })
+    let writers = FLUSH_LIST.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    for handle in &writers {
+        handle.borrow_mut().flush()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

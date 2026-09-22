@@ -114,9 +114,72 @@ pub enum Address {
 #[derive(Debug)]
 /// A single part of an RE replacement
 pub enum ReplacementPart {
-    Literal(Vec<u8>), // Normal text
-    WholeMatch,       // &
-    Group(u32),       // \1 to \9
+    Literal(Vec<u8>),     // Normal text
+    WholeMatch,           // &
+    Group(u32),           // \1 to \9
+    Case(CaseConversion), // GNU \U \L \u \l \E
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// GNU case conversion of the replacement text that follows.
+pub enum CaseConversion {
+    /// `\U`: upper-case until `\L` or `\E`
+    Upper,
+    /// `\L`: lower-case until `\U` or `\E`
+    Lower,
+    /// `\u`: upper-case the next character
+    UpperNext,
+    /// `\l`: lower-case the next character
+    LowerNext,
+    /// `\E`: stop `\U` or `\L`
+    End,
+}
+
+/// Replacement text under GNU case conversion.
+#[derive(Default)]
+struct CasedText {
+    text: Vec<u8>,
+    span: Option<CaseConversion>,
+    next: Option<CaseConversion>,
+}
+
+impl CasedText {
+    fn convert(&mut self, conversion: CaseConversion) {
+        match conversion {
+            CaseConversion::Upper | CaseConversion::Lower => self.span = Some(conversion),
+            CaseConversion::End => self.span = None,
+            next => self.next = Some(next),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.span.is_none() && self.next.is_none() {
+            self.text.extend_from_slice(bytes);
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let mut chars = text.chars();
+        if let Some(next) = self.next.take()
+            && let Some(first) = chars.next()
+        {
+            match next {
+                CaseConversion::UpperNext => {
+                    self.text.extend(first.to_uppercase().to_string().bytes());
+                }
+                _ => self.text.extend(first.to_lowercase().to_string().bytes()),
+            }
+        }
+        let rest: String = chars.collect();
+        let rest = match self.span {
+            Some(CaseConversion::Upper) => rest.to_uppercase(),
+            Some(CaseConversion::Lower) => rest.to_lowercase(),
+            _ => rest,
+        };
+        self.text.extend(rest.bytes());
+    }
 }
 
 // The maximum value allowed in regex quantifier
@@ -181,42 +244,46 @@ impl ReplacementTemplate {
             );
         }
 
+        let mut cased = CasedText::default();
         for part in &self.parts {
             match part {
-                ReplacementPart::Literal(s) => result.extend_from_slice(s),
+                ReplacementPart::Literal(s) => cased.push(s),
 
                 ReplacementPart::WholeMatch => {
-                    result
-                        .extend_from_slice(caps.get(0)?.map(|m| m.as_bytes()).unwrap_or_default());
+                    cased.push(caps.get(0)?.map(|m| m.as_bytes()).unwrap_or_default());
                 }
 
                 ReplacementPart::Group(n) => {
                     let i: usize = (*n).try_into().unwrap();
-                    result
-                        .extend_from_slice(caps.get(i)?.map(|m| m.as_bytes()).unwrap_or_default());
+                    cased.push(caps.get(i)?.map(|m| m.as_bytes()).unwrap_or_default());
                 }
+
+                ReplacementPart::Case(conversion) => cased.convert(*conversion),
             }
         }
+        result.extend(cased.text);
 
         Ok(result)
     }
 
     /// Apply the template to the given RE single match.
     pub fn apply_match(&self, m: &Match) -> Vec<u8> {
-        let mut result = Vec::new();
+        let mut cased = CasedText::default();
 
         for part in &self.parts {
             match part {
-                ReplacementPart::Literal(s) => result.extend_from_slice(s),
+                ReplacementPart::Literal(s) => cased.push(s),
 
-                ReplacementPart::WholeMatch => result.extend_from_slice(m.as_bytes()),
+                ReplacementPart::WholeMatch => cased.push(m.as_bytes()),
 
                 ReplacementPart::Group(_) => {
                     panic!("unexpected Regex group replacement")
                 }
+
+                ReplacementPart::Case(conversion) => cased.convert(*conversion),
             }
         }
-        result
+        cased.text
     }
 }
 
@@ -226,6 +293,7 @@ pub struct Substitution {
     pub regex: Option<Regex>,                         // Regular expression
     pub replacement: ReplacementTemplate,             // Specified broken-down replacement
     pub occurrence: usize,                            // Which occurrence to substitute
+    pub global: bool,                                 // With `occurrence`: also every later one
     pub print_flag: bool,                             // True if 'p' flag
     pub p_before_e: bool,                             // True if 'p' appears before 'e'
     pub ignore_case: bool,                            // True if 'I' flag

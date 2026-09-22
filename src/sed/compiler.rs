@@ -9,8 +9,9 @@
 // file that was distributed with this source code.
 
 use crate::sed::command::{
-    Address, CharacterMode, Command, CommandData, ParsedTransliteration, ProcessingContext,
-    RegexMode, ReplacementPart, ReplacementTemplate, Substitution, Transliteration,
+    Address, CaseConversion, CharacterMode, Command, CommandData, ParsedTransliteration,
+    ProcessingContext, RegexMode, ReplacementPart, ReplacementTemplate, Substitution,
+    Transliteration,
 };
 use crate::sed::delimited_parser::{
     os_string_from_bytes, parse_char_escape, parse_regex_for_mode, parse_transliteration_for_mode,
@@ -767,6 +768,21 @@ pub fn compile_replacement(
                             line.advance();
                         }
 
+                        // GNU case conversion
+                        c @ ('U' | 'L' | 'u' | 'l' | 'E') => {
+                            if !literal.is_empty() {
+                                parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+                            }
+                            parts.push(ReplacementPart::Case(match c {
+                                'U' => CaseConversion::Upper,
+                                'L' => CaseConversion::Lower,
+                                'u' => CaseConversion::UpperNext,
+                                'l' => CaseConversion::LowerNext,
+                                _ => CaseConversion::End,
+                            }));
+                            line.advance();
+                        }
+
                         // Literal delimiter
                         v if v == delimiter => {
                             literal.push(line.current_byte());
@@ -945,9 +961,12 @@ pub fn compile_subst_flags(
     posix: bool,
     sandbox: bool,
 ) -> UResult<()> {
-    let mut seen_g_or_n = false;
+    // GNU: `g` with a number N replaces the Nth match and every later one.
+    let mut seen_g = false;
+    let mut seen_n = false;
 
     subst.occurrence = 1; // default
+    subst.global = false;
     subst.print_flag = false;
     subst.p_before_e = false;
     subst.ignore_case = false;
@@ -963,15 +982,14 @@ pub fn compile_subst_flags(
 
         match line.current() {
             'g' => {
-                if seen_g_or_n {
+                if seen_g {
                     return compilation_error(
                         lines,
                         line,
                         "multiple 'g' or numeric flags in substitute command",
                     );
                 }
-                seen_g_or_n = true;
-                subst.occurrence = 0;
+                seen_g = true;
                 line.advance();
             }
 
@@ -1011,7 +1029,7 @@ pub fn compile_subst_flags(
             }
 
             _c @ '1'..='9' => {
-                if seen_g_or_n {
+                if seen_n {
                     return compilation_error(
                         lines,
                         line,
@@ -1036,7 +1054,7 @@ pub fn compile_subst_flags(
                 }
 
                 subst.occurrence = number;
-                seen_g_or_n = true;
+                seen_n = true;
             }
 
             'w' => {
@@ -1046,7 +1064,7 @@ pub fn compile_subst_flags(
                 let location = ScriptLocation::at_position(lines, line);
                 let path = read_file_path(lines, line)?;
                 subst.write_file = Some(NamedWriter::new(path, location)?);
-                return Ok(()); // 'w' is the last flag allowed
+                break; // 'w' is the last flag allowed
             }
 
             ';' | '\n' => break,
@@ -1061,6 +1079,13 @@ pub fn compile_subst_flags(
         }
     }
 
+    if seen_g {
+        if subst.occurrence <= 1 {
+            subst.occurrence = 0;
+        } else {
+            subst.global = true;
+        }
+    }
     Ok(())
 }
 
@@ -2624,27 +2649,32 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_subst_flag_g_and_number_should_fail() {
-        let (lines, mut chars) = make_providers("g3");
+    fn test_compile_subst_flag_g_and_number_combine() {
+        // GNU: replace the Nth match and every later one, in either order.
+        for flags in ["g3", "3g"] {
+            let (lines, mut chars) = make_providers(flags);
+            let mut subst = Substitution::default();
+            compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap();
+            assert_eq!((subst.occurrence, subst.global), (3, true));
+        }
+        let (lines, mut chars) = make_providers("1g");
         let mut subst = Substitution::default();
-
-        let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("multiple 'g' or numeric flags in substitute command")
-        );
+        compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap();
+        assert_eq!((subst.occurrence, subst.global), (0, false));
     }
 
     #[test]
-    fn test_compile_subst_flag_number_and_g_should_fail() {
-        let (lines, mut chars) = make_providers("2g");
-        let mut subst = Substitution::default();
-
-        let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("multiple 'g' or numeric flags in substitute command")
-        );
+    fn test_compile_subst_flag_repeated_g_or_number_fails() {
+        for flags in ["gg", "3g4"] {
+            let (lines, mut chars) = make_providers(flags);
+            let mut subst = Substitution::default();
+            let err =
+                compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("multiple 'g' or numeric flags in substitute command")
+            );
+        }
     }
 
     #[test]

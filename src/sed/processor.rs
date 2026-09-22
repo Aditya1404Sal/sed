@@ -374,7 +374,10 @@ fn substitute(
                     // Always write the unmatched text before this match.
                     result.extend_from_slice(&text[last_end..m.start()]);
 
-                    if sub.occurrence == 0 || count == sub.occurrence {
+                    if sub.occurrence == 0
+                        || count == sub.occurrence
+                        || (sub.global && count > sub.occurrence)
+                    {
                         let replacement = sub.replacement.apply_captures(command, &caps)?;
                         result.extend_from_slice(&replacement);
                         replaced = true;
@@ -387,7 +390,7 @@ fn substitute(
 
                     // Early exit if only a specific occurrence,
                     // (likely 1) needed replacing.
-                    if count == sub.occurrence {
+                    if count == sub.occurrence && !sub.global {
                         break 'captures Ok(());
                     }
                 }

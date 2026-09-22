@@ -240,6 +240,24 @@ mod tests {
     }
 
     #[test]
+    fn gnu_substitution_extensions() {
+        assert_eq!(run(&["s/a/A/2g"], "aaaa\n").0, "aAAA\n");
+        assert_eq!(
+            run(&[r"s/\(\w\+\) \(\w\+\)/\u\1 \U\2\E!/"], "hello world\n").0,
+            "Hello WORLD!\n"
+        );
+        assert_eq!(run(&[r"s/.*/\L\u&/"], "hELLO\n").0, "Hello\n");
+    }
+
+    #[test]
+    fn locale_override_selects_utf8() {
+        crate::sed::set_locale(Some("C.UTF-8".into()));
+        assert_eq!(run(&["s/h./H/"], "héllo\n").0, "Hllo\n");
+        assert_eq!(run(&["-E", r"s/(ab)\1/X/"], "abab\n").0, "X\n");
+        crate::sed::set_locale(None);
+    }
+
+    #[test]
     fn exec_is_refused() {
         let argv = ["sed", "s/x/y/e"].map(std::ffi::OsString::from);
         assert!(Engine::new(argv.into_iter()).is_err());

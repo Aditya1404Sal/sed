@@ -269,13 +269,27 @@ pub fn character_mode_for_locale(locale: &str) -> UResult<CharacterMode> {
     }
 }
 
+thread_local! {
+    /// The locale an embedder supplies for this thread's subsequent runs.
+    static LOCALE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Supply the locale for subsequent runs on this thread, in place of
+/// `LC_ALL`/`LC_CTYPE`/`LANG` from the process environment: an embedding
+/// shell's environment is not its process's. `None` restores the default.
+pub fn set_locale(locale: Option<String>) {
+    LOCALE.with(|cell| *cell.borrow_mut() = locale);
+}
+
 /// Return a ProcessingContext based on parsed CLI flags and environment.
 fn build_context(matches: &ArgMatches) -> UResult<ProcessingContext> {
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-        .into_iter()
-        .find_map(|name| {
-            let value = env::var(name).ok()?;
-            (!value.is_empty()).then_some(value)
+    let locale = LOCALE
+        .with(|cell| cell.borrow().clone())
+        .or_else(|| {
+            ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().find_map(|name| {
+                let value = env::var(name).ok()?;
+                (!value.is_empty()).then_some(value)
+            })
         })
         // Same default as GNU sed
         .unwrap_or_else(|| "C".to_string());

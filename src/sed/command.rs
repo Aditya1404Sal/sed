@@ -56,6 +56,9 @@ pub struct ProcessingContext {
     pub last_file: bool,
     /// Stop processing further input.
     pub stop_processing: bool,
+    /// The status `q` or `Q` asked for; embedders read it here rather than from the
+    /// process-wide exit code.
+    pub quit_code: Option<i32>,
     /// Whether sed operates on bytes or UTF-8 characters
     pub character_mode: CharacterMode,
     /// Previously compiled RE, saved for reuse when specifying an empty RE

@@ -62,7 +62,6 @@ impl Engine {
     /// script. Returns the engine and its input operands; `-` names
     /// standard input. The `e` command and `s///e` flag are refused.
     pub fn new(args: impl uucore::Args) -> UResult<(Self, Vec<PathBuf>)> {
-        uucore::error::set_exit_code(0);
         let matches = uu_app().try_get_matches_from(normalize_in_place(args))?;
         let (scripts, files) = get_scripts_files(&matches)?;
         let mut context = build_context(&matches)?;
@@ -150,7 +149,7 @@ impl Engine {
 
     /// The exit status set by `q` or `Q`, else 0.
     pub fn exit_code(&self) -> i32 {
-        uucore::error::get_exit_code()
+        self.context.quit_code.unwrap_or(0)
     }
 
     /// Output that zero-address commands (`0r file`) produce before input.

@@ -885,17 +885,19 @@ pub fn process_line(
                 }
                 'q' => {
                     // Quit after printing the pattern space.
-                    set_exit_code(
-                        i32::try_from(*extract_variant!(command, Number)).unwrap_or(i32::MAX),
-                    );
+                    let code =
+                        i32::try_from(*extract_variant!(command, Number)).unwrap_or(i32::MAX);
+                    set_exit_code(code);
+                    context.quit_code = Some(code);
                     context.stop_processing = true;
                     break;
                 }
                 'Q' => {
                     // Quit immediatelly.
-                    set_exit_code(
-                        i32::try_from(*extract_variant!(command, Number)).unwrap_or(i32::MAX),
-                    );
+                    let code =
+                        i32::try_from(*extract_variant!(command, Number)).unwrap_or(i32::MAX);
+                    set_exit_code(code);
+                    context.quit_code = Some(code);
                     context.stop_processing = true;
                     context.quiet = true;
                     break;

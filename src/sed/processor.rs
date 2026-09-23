@@ -425,14 +425,31 @@ fn substitute(
 
         // Write to file if needed.
         if let Some(ref writer) = sub.write_file {
-            writer
-                .borrow_mut()
-                .write_line_bytes(pattern.as_bytes(), pattern.is_newline_terminated())?;
+            write_named(
+                writer,
+                output,
+                pattern.as_bytes(),
+                pattern.is_newline_terminated(),
+            )?;
         }
         context.substitution_made = true;
     }
 
     Ok(())
+}
+
+/// Writes a `w` line to its file or, for `/dev/stdout`, to sed's own output as GNU sed does.
+fn write_named(
+    writer: &RefCell<crate::sed::named_writer::NamedWriter>,
+    output: &mut OutputBuffer,
+    line: &[u8],
+    newline: bool,
+) -> UResult<()> {
+    if writer.borrow().is_standard_output() {
+        output.write_chunk(&IOChunk::from_bytes(line.to_vec(), newline))?;
+        return Ok(());
+    }
+    writer.borrow_mut().write_line_bytes(line, newline)
 }
 
 /// Apply the specified transliteration in the provided pattern space.
@@ -946,9 +963,12 @@ pub fn process_line(
                 'w' => {
                     // Append the pattern space to the specified file.
                     let writer = extract_variant!(command, NamedWriter);
-                    writer
-                        .borrow_mut()
-                        .write_line_bytes(pattern.as_bytes(), pattern.is_newline_terminated())?;
+                    write_named(
+                        writer,
+                        output,
+                        pattern.as_bytes(),
+                        pattern.is_newline_terminated(),
+                    )?;
                 }
                 'W' => {
                     // Append only the first line of the pattern space.
@@ -960,7 +980,9 @@ pub fn process_line(
                             Some(pos) => (&pattern_bytes[..=pos], true),
                             None => (pattern_bytes, false),
                         };
-                    writer.borrow_mut().write_line_bytes(
+                    write_named(
+                        writer,
+                        output,
                         first_line,
                         !found_newline && pattern.is_newline_terminated(),
                     )?;

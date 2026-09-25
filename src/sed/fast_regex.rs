@@ -46,7 +46,10 @@ fn byte_regex_pattern(pattern: &[u8]) -> String {
 // For example, r"\\1" and r"[\1]" will match, whereas only a number
 // after an odd number of backslashes and outside a character class
 // should match.
-static NEEDS_FANCY_RE: LazyLock<ByteRegex> = LazyLock::new(|| ByteRegex::new(r"\\[1-9]").unwrap());
+// `(?<` also catches the lookaround assertions the parser builds for GNU's `\<`/`\>`
+// word-boundary escapes, which regex::bytes does not support.
+static NEEDS_FANCY_RE: LazyLock<ByteRegex> =
+    LazyLock::new(|| ByteRegex::new(r"\\[1-9]|\(\?<").unwrap());
 
 /// All characters signifying that the match must be handled by an RE
 /// rather than by plain string pattern matching.
@@ -248,7 +251,7 @@ impl Regex {
             if character_mode == CharacterMode::Byte {
                 return Err(USimpleError::new(
                     2,
-                    "back-references are not supported in byte mode",
+                    "back-references and \\< \\> word-boundary escapes are not supported in byte mode",
                 ));
             }
             let pattern =
@@ -626,7 +629,8 @@ mod tests {
         let err = Regex::new(r"(.)\1", CharacterMode::Byte)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("back-references are not supported in byte mode"));
+        assert!(err.contains("back-references"));
+        assert!(err.contains("not supported in byte mode"));
     }
 
     #[test]

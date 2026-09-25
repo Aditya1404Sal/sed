@@ -403,6 +403,26 @@ pub fn parse_regex_for_mode(
                     line.advance();
                     continue;
                 }
+                // GNU word-boundary escapes are RE assertions, not character escapes:
+                // `\b` must reach the RE engine as a word-boundary assertion (`\x08` is
+                // spelled `\cH` or `\x08` in a GNU sed RE), and `\<`/`\>` (word start/end,
+                // which no supported RE engine spells natively) are translated into
+                // lookaround assertions built on `\w`.
+                if line.current() == 'b' {
+                    result.extend_from_slice(br"\b");
+                    line.advance();
+                    continue;
+                }
+                if line.current() == '<' {
+                    result.extend_from_slice(br"(?<!\w)(?=\w)");
+                    line.advance();
+                    continue;
+                }
+                if line.current() == '>' {
+                    result.extend_from_slice(br"(?<=\w)(?!\w)");
+                    line.advance();
+                    continue;
+                }
                 if let Some(decoded) = parse_char_escape(line) {
                     push_script_char(&mut result, decoded, character_mode);
                 } else {

@@ -846,7 +846,11 @@ pub fn compile_replacement(
     loop {
         while !line.eol() {
             match line.current() {
-                '\\' => {
+                // Same reasoning as the pattern-side parsers: when `\` is itself the delimiter,
+                // it closes the replacement (the `c if c == delimiter` arm below) rather than
+                // starting an escape — verified against the oracle (`s\foo\bar\` closes cleanly
+                // on the replacement's own trailing `\`, the same as the pattern's).
+                '\\' if delimiter != '\\' => {
                     line.advance();
 
                     // Line input_action
@@ -971,14 +975,12 @@ fn compile_subst_command(
         return compilation_error(lines, line, "unterminated `s' command");
     }
 
-    let delimiter = line.current();
-    if delimiter == '\0' || delimiter == '\\' {
-        return compilation_error(
-            lines,
-            line,
-            "substitute pattern cannot be delimited by newline or backslash",
-        );
-    }
+    // GNU accepts a backslash as the delimiter (`s\a\b\`) — verified against the oracle, which
+    // ran it with no error at all. A literal embedded NUL byte can't actually reach here in
+    // practice (argv strings are NUL-terminated by the OS itself), so there is no real "can't be
+    // delimited by X" case left to reject up front; whatever GNU would reject, it rejects
+    // downstream through the normal parse — e.g. an actually-unterminated command still reports
+    // `unterminated `s' command` on its own, just like any other delimiter would.
 
     let regex_mode = if context.regex_extended {
         RegexMode::Extended
@@ -1049,17 +1051,25 @@ fn compile_trans_command(
 ) -> UResult<CommandHandling> {
     line.advance(); // move past 'y'
 
-    let delimiter = line.current();
-    if delimiter == '\0' || delimiter == '\\' {
-        return compilation_error(
-            lines,
-            line,
-            "transliteration string cannot be delimited by newline or backslash",
-        );
+    // `y` with nothing after it (not even a delimiter) — mirrors the same guard
+    // `compile_subst_command` has for a bare `s`, and GNU's own wording for it, verified against
+    // the oracle. Used to reach `line.current()` right below with nothing left to look at and
+    // panic (index out of bounds) instead.
+    if line.eol() {
+        return compilation_error(lines, line, "unterminated `y' command");
     }
 
-    let source = parse_transliteration_for_mode(lines, line, context.character_mode)?;
-    let target = parse_transliteration_for_mode(lines, line, context.character_mode)?;
+    // GNU accepts a backslash as the delimiter (`y\a\b\`) — verified against the oracle, which
+    // ran it with no error at all, the same as for `s` above.
+
+    let source = remap_unterminated(
+        parse_transliteration_for_mode(lines, line, context.character_mode),
+        "unterminated `y' command",
+    )?;
+    let target = remap_unterminated(
+        parse_transliteration_for_mode(lines, line, context.character_mode),
+        "unterminated `y' command",
+    )?;
     let transliteration = match (source, target) {
         (ParsedTransliteration::Bytes(source), ParsedTransliteration::Bytes(target)) => {
             if source.len() != target.len() {
@@ -2892,17 +2902,58 @@ mod tests {
 
     // compile_subst_command
     #[test]
-    fn test_compile_subst_invalid_delimiter_backslash() {
+    fn test_compile_subst_backslash_delimiter_is_accepted() {
+        // GNU accepts a backslash as the `s` delimiter — verified against the oracle
+        // (`sed 's\foo\bar\'` runs with no error at all), unlike this fork's own earlier,
+        // unverified assumption that it (like a raw NUL byte, which can't reach here in
+        // practice) should be refused up front.
         let (mut lines, mut chars) = make_providers("s\\foo\\bar\\");
         let mut cmd = Command::default();
         let mut context = ctx();
 
+        let result = compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // compile_trans_command
+    #[test]
+    fn test_compile_trans_bare_y_reports_unterminated_instead_of_panicking() {
+        // A bare `y` (not even a delimiter) used to reach `line.current()` with nothing left to
+        // look at and panic (index out of bounds) — GNU's own wording, verified against the
+        // oracle (`sed 'y'` -> `` unterminated `y' command ``).
+        let (mut lines, mut chars) = make_providers("y");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
         let err =
-            compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("substitute pattern cannot be delimited")
-        );
+            compile_trans_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
+        assert!(err.to_string().contains("unterminated `y' command"));
+    }
+
+    #[test]
+    fn test_compile_trans_backslash_delimiter_is_accepted() {
+        // GNU accepts a backslash as the `y` delimiter too — verified against the oracle
+        // (`sed 'y\a\b\'` runs with no error at all).
+        let (mut lines, mut chars) = make_providers("y\\a\\b\\");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        let result = compile_trans_command(&mut lines, &mut chars, &mut cmd, &mut context);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn test_compile_trans_unterminated_reports_ys_own_wording() {
+        // `y/a` (a delimiter and a source with no closing delimiter) used to report the shared,
+        // generic "unterminated transliteration string" — GNU's own wording names the command,
+        // `` unterminated `y' command ``, verified against the oracle.
+        let (mut lines, mut chars) = make_providers("y/a");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        let err =
+            compile_trans_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
+        assert!(err.to_string().contains("unterminated `y' command"));
     }
 
     #[test]

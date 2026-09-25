@@ -501,10 +501,10 @@ fn scan_delimiter(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> 
         return compilation_error(lines, line, "unexpected end of line".to_string());
     }
 
+    // GNU accepts a backslash as a delimiter — verified against the oracle for both `s\a\b\`
+    // and `y\a\b\`, run with no error at all; this fork's own earlier, unverified assumption
+    // that it should be refused up front was wrong.
     let delimiter = line.current();
-    if delimiter == '\\' {
-        return compilation_error(lines, line, "\\ cannot be used as a string delimiter");
-    }
     line.advance(); // skip the opening delimiter
     Ok(delimiter)
 }
@@ -556,7 +556,12 @@ pub fn parse_regex_for_mode(
                 result.extend_from_slice(&cc);
                 continue;
             }
-            '\\' => {
+            // Guarded the same way every other special character below is: when the delimiter
+            // IS `\`, seeing one closes the pattern (the `c if c == delimiter` arm further down)
+            // rather than starting an escape sequence — GNU checks for the closing delimiter
+            // before anything else, verified against the oracle (`s\a\b\` closes on the very
+            // first `\` after each of "a" and "b", it doesn't read as an unterminated escape).
+            '\\' if delimiter != '\\' => {
                 line.advance();
                 if line.eol() {
                     return compilation_error(lines, line, "unterminated regular expression");
@@ -859,7 +864,10 @@ fn parse_transliteration_bytes(
 
     while !line.eol() {
         match line.current() {
-            '\\' => {
+            // Same reasoning as `parse_regex_for_mode`'s own guard: when `\` is itself the
+            // delimiter, it closes the operand (the `c if c == delimiter` arm below) instead of
+            // starting an escape — verified against the oracle (`y\a\b\` closes cleanly).
+            '\\' if delimiter != '\\' => {
                 line.advance();
                 if line.eol() {
                     return compilation_error(lines, line, "unterminated transliteration string");
@@ -1606,13 +1614,17 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_backslash_delimiter() {
+    fn accepts_backslash_as_delimiter() {
+        // GNU accepts a backslash as a delimiter — verified against the oracle for both `s` and
+        // `y`. An unclosed one (no second `\`) still reports the ordinary unterminated-regex
+        // error, the same as any other delimiter would.
         let (lines, mut line) = make_providers("\\bad");
         let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("\\ cannot be used as a string delimiter")
-        );
+        assert!(err.to_string().contains("unterminated regular expression"));
+
+        let (lines, mut line) = make_providers("\\bad\\");
+        let pattern = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
+        assert_eq!(pattern, b"bad");
     }
 
     #[test]

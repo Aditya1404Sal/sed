@@ -19,7 +19,12 @@ use uucore::error::{FromIo, UResult};
 #[derive(Debug, PartialEq)]
 /// The specification of a script: through a string or a file
 pub enum ScriptValue {
-    StringVal(String),
+    /// Raw script bytes (`-e`, or the first-POSIX-form positional script argument): bytes, not
+    /// `String`, so a raw byte from the shell (e.g. `x=$'\xff'; sed "s/$x/X/"`) survives as
+    /// that exact byte, rather than needing to already be valid UTF-8 to reach here at all (a
+    /// `String`-typed clap argument turns away anything less with "invalid utf-8 was detected
+    /// in one or more arguments" before this code ever runs).
+    StringVal(Vec<u8>),
     PathVal(PathBuf),
 }
 
@@ -114,7 +119,7 @@ impl ScriptLineProvider {
 
         match &self.sources[next_index] {
             ScriptValue::StringVal(s) => {
-                let cursor = std::io::Cursor::new(s.as_bytes().to_vec());
+                let cursor = std::io::Cursor::new(s.clone());
                 self.state = State::Active {
                     index: next_index,
                     reader: Box::new(BufReader::new(cursor)),
@@ -192,8 +197,8 @@ mod tests {
     #[test]
     fn test_string_source() {
         let input = vec![
-            ScriptValue::StringVal("line one\nline two\n".to_string()),
-            ScriptValue::StringVal("line three".to_string()),
+            ScriptValue::StringVal(b"line one\nline two\n".to_vec()),
+            ScriptValue::StringVal(b"line three".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(input);
 
@@ -231,11 +236,11 @@ mod tests {
 
         let input = vec![
             ScriptValue::PathVal(temp_file.path().to_path_buf()),
-            ScriptValue::StringVal("script line 1".to_string()),
+            ScriptValue::StringVal(b"script line 1".to_vec()),
             ScriptValue::PathVal(temp_file.path().to_path_buf()),
-            ScriptValue::StringVal(String::new()),
+            ScriptValue::StringVal(Vec::new()),
             ScriptValue::PathVal(temp_file2.path().to_path_buf()),
-            ScriptValue::StringVal("other script line 1".to_string()),
+            ScriptValue::StringVal(b"other script line 1".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(input);
 
@@ -260,8 +265,8 @@ mod tests {
     #[test]
     fn test_getters() {
         let input = vec![
-            ScriptValue::StringVal("l1\nl2\n".to_string()),
-            ScriptValue::StringVal("l3".to_string()),
+            ScriptValue::StringVal(b"l1\nl2\n".to_vec()),
+            ScriptValue::StringVal(b"l3".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(input);
 

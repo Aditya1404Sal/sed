@@ -116,7 +116,13 @@ pub fn uu_app() -> Command {
         .args_override_self(true)
         .infer_long_args(true)
         .args([
-            arg!([script] "Script to execute if not otherwise provided."),
+            // `OsString`-typed: this argument doubles as the script's literal *bytes* (the
+            // first-POSIX-form `sed SCRIPT [file...]`) or, when `-e`/`-f` supplied the script
+            // instead, as an input file's path — either way, raw bytes, not text a `String`
+            // value_parser would refuse to hold. See `expression` (`-e`) for the same reason.
+            Arg::new("script")
+                .help("Script to execute if not otherwise provided.")
+                .value_parser(clap::value_parser!(OsString)),
             Arg::new("file")
                 .help("Input files")
                 .value_parser(clap::value_parser!(PathBuf))
@@ -133,7 +139,12 @@ pub fn uu_app() -> Command {
                 .short_alias('r')
                 .help("Use extended regular expressions.")
                 .action(clap::ArgAction::SetTrue),
-            arg!(-e --expression <SCRIPT> "Add script to executed commands.")
+            Arg::new("expression")
+                .short('e')
+                .long("expression")
+                .value_name("SCRIPT")
+                .help("Add script to executed commands.")
+                .value_parser(clap::value_parser!(OsString))
                 .action(clap::ArgAction::Append),
             // Access with .get_many::<PathBuf>("file")
             Arg::new("script-file")
@@ -192,24 +203,33 @@ fn get_scripts_files(matches: &ArgMatches) -> UResult<(Vec<ScriptValue>, Vec<Pat
         // Second and third POSIX usage cases; clap script arg is actually an input file
         // sed [-En] -e script [-e script]... [-f script_file]... [file...]
         // sed [-En] [-e script]... -f script_file [-f script_file]... [file...]
-        if let Some(val) = matches.get_one::<String>("script") {
+        if let Some(val) = matches.get_one::<OsString>("script") {
             files.push(PathBuf::from(val.to_owned()));
         }
     } else {
         // First POSIX spec usage case; script is the first arg.
         // sed [-En] script [file...]
-        if let Some(val) = matches.get_one::<String>("script") {
-            indexed_scripts.push((0, ScriptValue::StringVal(val.to_owned())));
+        if let Some(val) = matches.get_one::<OsString>("script") {
+            indexed_scripts.push((
+                0,
+                ScriptValue::StringVal(val.to_owned().into_encoded_bytes()),
+            ));
         } else {
             return Err(UUsageError::new(1, "missing script"));
         }
     }
 
-    // Capture -e occurrences (STRING)
+    // Capture -e occurrences (bytes, not text: see `expression`'s own value_parser)
     if let Some(indices) = matches.indices_of("expression") {
-        for (idx, val) in indices.zip(matches.get_many::<String>("expression").unwrap_or_default())
-        {
-            indexed_scripts.push((idx, ScriptValue::StringVal(val.to_owned())));
+        for (idx, val) in indices.zip(
+            matches
+                .get_many::<OsString>("expression")
+                .unwrap_or_default(),
+        ) {
+            indexed_scripts.push((
+                idx,
+                ScriptValue::StringVal(val.to_owned().into_encoded_bytes()),
+            ));
         }
     }
 
@@ -359,7 +379,7 @@ mod tests {
         let matches = get_test_matches(&["1d", "file1.txt"]);
         let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-        assert_eq!(scripts, vec![ScriptValue::StringVal("1d".to_string())]);
+        assert_eq!(scripts, vec![ScriptValue::StringVal(b"1d".to_vec())]);
         assert_eq!(files, vec![PathBuf::from("file1.txt")]);
     }
 
@@ -370,7 +390,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(files, vec![PathBuf::from("file1.txt")]);
     }
@@ -394,7 +414,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(
             files,
@@ -409,7 +429,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(
             files,
@@ -424,7 +444,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(files, vec![PathBuf::from("-")]); // Stdin should be used
     }
@@ -436,7 +456,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(files, vec![PathBuf::from("-")]); // Stdin should be used
     }
@@ -546,7 +566,7 @@ mod tests {
         let (scripts, files) = get_scripts_files(&matches).unwrap();
         assert!(ctx.in_place);
         assert_eq!(ctx.in_place_suffix, None);
-        assert_eq!(scripts, vec![ScriptValue::StringVal("s/a/b/".to_string())]);
+        assert_eq!(scripts, vec![ScriptValue::StringVal(b"s/a/b/".to_vec())]);
         assert_eq!(files, vec![PathBuf::from("file.txt")]);
     }
 

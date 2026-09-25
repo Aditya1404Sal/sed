@@ -1841,7 +1841,7 @@ mod tests {
     fn make_line_provider(lines: &[&str]) -> ScriptLineProvider {
         let input = lines
             .iter()
-            .map(|s| ScriptValue::StringVal((*s).to_string()))
+            .map(|s| ScriptValue::StringVal((*s).as_bytes().to_vec()))
             .collect();
         ScriptLineProvider::new(input)
     }
@@ -2489,7 +2489,7 @@ mod tests {
     // compile
     #[test]
     fn test_compile_single_command() {
-        let scripts = vec![ScriptValue::StringVal("1q".to_string())];
+        let scripts = vec![ScriptValue::StringVal(b"1q".to_vec())];
         let mut opts = ProcessingContext::default();
 
         let result = compile(scripts, &mut opts).unwrap();
@@ -2509,7 +2509,7 @@ mod tests {
 
     #[test]
     fn test_compile_two_commands() {
-        let scripts = vec![ScriptValue::StringVal("l;q".to_string())];
+        let scripts = vec![ScriptValue::StringVal(b"l;q".to_vec())];
         let mut opts = ProcessingContext::default();
 
         let result = compile(scripts, &mut opts).unwrap();
@@ -2641,8 +2641,8 @@ mod tests {
     #[test]
     fn test_compile_replacement_line_continuation() {
         let script = vec![
-            ScriptValue::StringVal("/first line\\".to_string()),
-            ScriptValue::StringVal(" continued/".to_string()),
+            ScriptValue::StringVal(b"/first line\\".to_vec()),
+            ScriptValue::StringVal(b" continued/".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(script);
         let first_line = provider.next_line().unwrap().unwrap();

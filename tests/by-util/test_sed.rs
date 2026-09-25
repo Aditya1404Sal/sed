@@ -1202,6 +1202,27 @@ fn subst_byte_escape_matches_raw_byte_in_ere_mode() {
         .stdout_is_bytes(b"X\n");
 }
 
+/// A raw (non-UTF-8) byte *in the script argument itself* — not a `\xHH` escape, but the
+/// literal byte, as arrives from a shell doing `x=$'\xff'; sed "s/$x/X/"` — also matches the
+/// same raw byte in the data. This needs `script`/`expression` to be `OsString`-valued clap
+/// arguments (not `String`, which would refuse a non-UTF-8 `OsString` outright) and
+/// `ScriptValue::StringVal` to carry `Vec<u8>` rather than `String` end to end.
+#[cfg(unix)]
+#[test]
+fn subst_raw_script_byte_matches_raw_data_byte() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let script = OsString::from_vec(b"s/\xff/X/".to_vec());
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .arg("-e")
+        .arg(script)
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
 /// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.
 #[test]
 fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {

@@ -2534,11 +2534,14 @@ fn test_addr0_second_re_only() {
 
 #[test]
 fn test_step_match_non_posix() {
+    // Under --posix, `~` isn't address syntax at all (not even to report it as a disabled
+    // extension) — it just falls through and reads as the next command, which isn't a real
+    // one — verified against the oracle.
     new_ucmd!()
         .args(&["--posix", "3~2p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 3: ~step is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 2: unknown command: `~'\n");
 }
 
 #[test]

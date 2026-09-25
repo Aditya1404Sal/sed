@@ -459,8 +459,17 @@ fn compile_address_range(
         n_addr += 1;
     }
 
+    // `~` as the separator itself (`N~step`, GNU's "every step'th line starting at N") only
+    // follows a *numeric* first address, and only outside --posix (where `~` isn't recognized
+    // as address syntax at all, falling through to read as the next command instead) — verified
+    // against the oracle: `$~2p` -> "unknown command: `~'" (not a step, since `$` isn't
+    // numeric), and `--posix 3~2p` -> the same "unknown command: `~'" (not the fork's own
+    // former, invented "~step is invalid in POSIX mode").
+    let tilde_step_eligible = !context.posix && matches!(cmd.addr1, Some(Address::Line(_)));
+    let tilde_starts_step = tilde_step_eligible && !line.eol() && line.current() == '~';
+
     line.eat_spaces();
-    if n_addr == 1 && !line.eol() && matches!(line.current(), ',' | '~') {
+    if n_addr == 1 && !line.eol() && (line.current() == ',' || tilde_starts_step) {
         let separator = line.current();
         let is_step_match = separator == '~'; // E.g. 0~2: Pick even-numbered lines
         line.advance();
@@ -474,7 +483,7 @@ fn compile_address_range(
             false
         };
 
-        if (is_step_match || is_step_end) && context.posix {
+        if is_step_end && context.posix {
             // ~ steps are a GNU extension.
             return compilation_error(lines, line, "~step is invalid in POSIX mode");
         }
@@ -568,6 +577,7 @@ fn compile_address(
     context: &ProcessingContext,
 ) -> UResult<Address> {
     let mut icase = false;
+    let mut multiline = false;
 
     if line.eol() {
         return compilation_error(lines, line, "expected context address");
@@ -599,13 +609,22 @@ fn compile_address(
             line.advance();
 
             line.eat_spaces();
-            if !line.eol() && line.current() == 'I' {
-                icase = true;
+            // `I`/`M` may each follow an address regex (case-insensitive / multiline), the same
+            // pair `s///` accepts as substitution flags, stackable in either order — verified
+            // against the oracle (`/re/M` reaches the same "missing command" a bare `/re/`
+            // followed by nothing does, meaning GNU recognizes `M` here as a flag, not a
+            // dangling attempt at the next command).
+            while !line.eol() && matches!(line.current(), 'I' | 'M') {
+                match line.current() {
+                    'I' => icase = true,
+                    'M' => multiline = true,
+                    _ => unreachable!(),
+                }
                 line.advance();
             }
 
             Ok(Address::Re(compile_regex(
-                lines, line, &re, context, icase, false,
+                lines, line, &re, context, icase, multiline,
             )?))
         }
         '$' => {

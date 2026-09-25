@@ -106,23 +106,40 @@ fn applies(
         // No address
         Ok(true)
     } else if let Some(addr2) = &command.addr2 {
-        // Two addresses
+        // Two addresses. Reset the shared "did this call end a range" flag so a stale
+        // `true` from a different two-address command's range end earlier in the script
+        // can't leak into this command's decision (e.g. whether `c` prints on this line).
+        context.last_address = false;
         if let Some(start) = command.start_line {
             // Range is already latched active.
             match addr2 {
                 Address::RelLine(n) => {
-                    if linenum - start > *n {
+                    let end = start + *n;
+                    if linenum >= end {
                         command.start_line = None;
-                        Ok(false)
+                        if linenum == end {
+                            context.last_address = true;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
                     } else {
                         Ok(true)
                     }
                 }
                 Address::Line(n) => {
-                    // Special case: already ended
-                    if linenum > *n {
+                    // The range's terminal line: latch off and flag it as the
+                    // range's last address so a single-shot command (like `c`)
+                    // fires on this line, not one line too late.
+                    if linenum >= *n {
                         command.start_line = None;
-                        Ok(false)
+                        if linenum == *n {
+                            context.last_address = true;
+                            Ok(true)
+                        } else {
+                            // Special case: already ended
+                            Ok(false)
+                        }
                     } else {
                         Ok(true)
                     }
@@ -132,6 +149,7 @@ fn applies(
                     // Inclusive end on multiple of step
                     if linenum.is_multiple_of(*step) {
                         command.start_line = None;
+                        context.last_address = true;
                     }
                     Ok(true)
                 }

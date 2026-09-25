@@ -2522,3 +2522,25 @@ fn test_word_start_end_escapes_refuse_in_byte_mode() {
         .args(&["-E", r"s/\<old_name\>/new_name/"])
         .pipe_in("old_name\n")
         .fails()
+        .stderr_contains("not supported in byte mode");
+}
+
+// FB-023: `c` on a two-address range must delete the whole range and print the
+// replacement text exactly once, at the range's last line.
+#[test]
+fn test_change_command_on_line_range() {
+    new_ucmd!()
+        .args(&["2,3c X"])
+        .pipe_in("alpha\nbeta\ngamma\ndelta\n")
+        .succeeds()
+        .stdout_is("alpha\nX\ndelta\n");
+}
+
+#[test]
+fn test_change_command_on_relative_range() {
+    new_ucmd!()
+        .args(&["2,+1c X"])
+        .pipe_in("alpha\nbeta\ngamma\ndelta\n")
+        .succeeds()
+        .stdout_is("alpha\nX\ndelta\n");
+}

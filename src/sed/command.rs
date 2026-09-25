@@ -473,6 +473,12 @@ pub struct InputAction {
     /// Data to prepend to the read contents (`N`); `None` replaces the
     /// pattern space with the next line (`n`).
     pub prepend: Option<Vec<u8>>,
+    /// Whether the line `prepend` came from (the one `N` was executed against) was itself
+    /// terminated by the input's delimiter. If `N` never gets a next line (input ends right
+    /// after), GNU's "print the pending pattern space" fallback must preserve that: it must
+    /// NOT add a delimiter that wasn't there, e.g. `printf 'a' | sed 'N'` (no trailing newline
+    /// in the input) must not gain one in the output. Only meaningful with `prepend: Some(_)`.
+    pub terminated: bool,
 }
 
 #[cfg(test)]

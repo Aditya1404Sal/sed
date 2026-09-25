@@ -1255,6 +1255,89 @@ fn subst_raw_script_byte_matches_raw_data_byte() {
         .stdout_is_bytes(b"X\n");
 }
 
+/// `-z` writes NUL, not `\n`, as the record terminator on output too, not just when reading
+/// input (FB-078/FA-077). Verified against the oracle.
+#[test]
+fn null_data_terminates_output_records_with_nul() {
+    new_ucmd!()
+        .arg("-z")
+        .arg("s/a/X/")
+        .pipe_in(b"a\0b\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\0b\0");
+}
+
+/// `N` reaching end of input on its very first, untouched attempt preserves the final line's
+/// own missing terminator — it does not gain one just because `N` never got a next line to
+/// join it with (FB-078/FA-077). Verified against the oracle.
+#[test]
+fn n_at_true_eof_does_not_add_a_missing_terminator() {
+    new_ucmd!()
+        .arg("N")
+        .pipe_in(b"a".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a");
+    // With a terminator to begin with, one is of course still there.
+    new_ucmd!()
+        .arg("N")
+        .pipe_in(b"a\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\n");
+}
+
+/// Once `N` has already joined a line, a *later* `N` reaching end of input in the same cycle
+/// (reached through `D`'s restart-without-reading) gets a terminator added regardless of the
+/// actual last line's own — a genuine GNU quirk, verified against the oracle both ways.
+#[test]
+fn n_at_eof_after_d_restart_adds_a_terminator_even_when_the_last_line_lacks_one() {
+    new_ucmd!()
+        .args(&["-e", "N", "-e", "D"])
+        .pipe_in(b"a\nb".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"b\n");
+}
+
+/// `-s` inserts the record terminator between two file operands when the first one's last
+/// line lacked one, carrying `pending_newline` across `InPlace::begin`'s per-file
+/// `OutputBuffer` (FB-078/FA-077's `-s`-interaction discovery) — `N` reaches true end of
+/// input at the end of *each* separate file, so this is the "N at EOF" case, not a join.
+/// Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn n_at_eof_terminator_carries_across_file_operands_with_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f1"), b"a").unwrap();
+    std::fs::write(dir.path().join("f2"), b"b").unwrap();
+
+    new_ucmd!()
+        .arg("-s")
+        .arg("N")
+        .arg(dir.path().join("f1"))
+        .arg(dir.path().join("f2"))
+        .succeeds()
+        .stdout_is_bytes(b"a\nb");
+}
+
+/// Without `-s`, two file operands form one continuous stream: `N` reads straight across the
+/// boundary as a real join (not an "N at EOF" case at all, so `f1`'s own missing terminator
+/// is irrelevant — it is `f2`'s line that `N` actually joins with, using the ordinary
+/// delimiter). Verified against the oracle: this happens to look identical to the `-s` case's
+/// output, for an unrelated reason (`f2` and `f1` are only one line long each).
+#[test]
+#[cfg(unix)]
+fn n_joins_across_file_operands_without_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f1"), b"a").unwrap();
+    std::fs::write(dir.path().join("f2"), b"b").unwrap();
+
+    new_ucmd!()
+        .arg("N")
+        .arg(dir.path().join("f1"))
+        .arg(dir.path().join("f2"))
+        .succeeds()
+        .stdout_is_bytes(b"a\nb");
+}
+
 /// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.
 #[test]
 fn trans_raw_invalid_script_byte_rejected_in_c_utf8_locale() {

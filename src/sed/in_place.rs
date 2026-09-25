@@ -32,6 +32,16 @@ pub struct InPlace {
     pub follow_symlinks: bool,
     pub temp_file: Option<NamedTempFile>,
     pub original_path: Option<PathBuf>,
+    /// The record terminator every `OutputBuffer` this constructs should use: NUL with `-z`,
+    /// else newline (`OutputBuffer::set_delimiter`'s own default). Stored here since
+    /// `begin_resolved` constructs a fresh `OutputBuffer` per file and no longer has the
+    /// original `ProcessingContext` once `new` has moved its other fields out of it.
+    delimiter: u8,
+    /// `-s`/`-i` (`context.separate`): whether each file is addressed (and, it turns out,
+    /// terminated) as its own stream rather than one continuous one — see `begin_resolved`'s
+    /// own comment for why this changes whether the `!self.in_place` branch may reuse the
+    /// existing `OutputBuffer`.
+    separate: bool,
 }
 
 impl InPlace {
@@ -39,13 +49,18 @@ impl InPlace {
     /// Depending on its settings it may or may not perform in-place
     /// editing, backup the original file, or follow symlinks.
     pub fn new(context: ProcessingContext) -> Self {
+        let delimiter = if context.null_data { b'\0' } else { b'\n' };
+        let mut output = OutputBuffer::new(Box::new(stdout()));
+        output.set_delimiter(delimiter);
         Self {
-            output: OutputBuffer::new(Box::new(stdout())),
+            output,
             in_place: context.in_place,
             in_place_suffix: context.in_place_suffix,
             follow_symlinks: context.follow_symlinks,
             temp_file: None,
             original_path: None,
+            delimiter,
+            separate: context.separate,
         }
     }
 
@@ -67,7 +82,25 @@ impl InPlace {
     /// to the context settings.
     fn begin_resolved(&mut self, file_name: &Path) -> UResult<&mut OutputBuffer> {
         if !self.in_place {
-            self.output = OutputBuffer::new(Box::new(stdout()));
+            // Every file writes to the same stdout here (this is `-s` without `-i`, or the
+            // plain single-stream case), but whether a fresh `OutputBuffer` should replace
+            // the existing one differs by mode — verified against the oracle both ways:
+            //
+            // - `-s` (`self.separate`): each file is its own stream, and if its last line
+            //   lacked a delimiter, GNU still writes one before the next file's own output
+            //   starts — reuse `self.output` so its `pending_newline` (see
+            //   `fast_io::OutputBuffer::write_chunk`) carries that decision across the
+            //   `in_place.begin()` call between files, whether or not `N` was involved.
+            // - Without `-s`: files form one continuous stream, and this fixture-verified
+            //   case (`test_multiple_input_files`) shows GNU does NOT insert one — an
+            //   unterminated non-final file's content is simply followed immediately by the
+            //   next file's, byte for byte. A fresh `OutputBuffer` here means any
+            //   `pending_newline` from the file just finished is silently dropped instead of
+            //   carried forward, which happens to be exactly the behavior this case needs.
+            if !self.separate {
+                self.output = OutputBuffer::new(Box::new(stdout()));
+                self.output.set_delimiter(self.delimiter);
+            }
             return Ok(&mut self.output);
         }
 
@@ -102,9 +135,10 @@ impl InPlace {
             fs::set_permissions(temp_file.path(), perms)?;
         }
 
-        let output = OutputBuffer::new(Box::new(
+        let mut output = OutputBuffer::new(Box::new(
             temp_file.reopen().expect("reopening NamedTempFile"),
         ));
+        output.set_delimiter(self.delimiter);
         self.output = output;
         self.temp_file = Some(temp_file);
         self.original_path = Some(file_name.to_path_buf());

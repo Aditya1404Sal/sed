@@ -89,7 +89,8 @@ impl Engine {
         let commands = compile(scripts, &mut context)?;
         let needs_last = uses_last_line(commands.as_ref());
         let sink = Rc::new(RefCell::new(Vec::new()));
-        let output = OutputBuffer::from_writer(Box::new(Sink(Rc::clone(&sink))));
+        let mut output = OutputBuffer::from_writer(Box::new(Sink(Rc::clone(&sink))));
+        output.set_delimiter(if context.null_data { b'\0' } else { b'\n' });
         Ok((
             Self {
                 commands,
@@ -161,12 +162,19 @@ impl Engine {
         if !self.context.quiet
             && !self.context.stop_processing
             && let Some(InputAction {
-                prepend: Some(mut pending),
+                prepend: Some(pending),
+                terminated,
                 ..
             }) = self.context.input_action.take()
         {
-            pending.push(b'\n');
-            self.output.write_bytes(&pending)?;
+            // Preserve the input's own "last line has no terminator" property
+            // (FB-078/FA-077): `write_chunk` (not `write_bytes`, which sniffs
+            // `bytes.ends_with(b"\n")` — wrong for `-z`, and wouldn't see a terminator this
+            // code appended itself anyway) only adds one back if the line `N` read it from
+            // actually had one, e.g. `printf 'a' | sed 'N'` (no trailing newline) must not
+            // gain one just because `N` never got a next line to join it with.
+            self.output
+                .write_chunk(&IOChunk::from_bytes(pending, terminated))?;
         }
         named_writer::flush_all()?;
         self.take(out)

@@ -210,9 +210,10 @@ fn populate_label_map(
             if let Some(label) = maybe_label
                 && cmd.code == ':'
             {
-                if context.label_to_command_map.contains_key(&label) {
-                    return semantic_error(&cmd.location, format!("duplicate label `{label}'"));
-                }
+                // GNU doesn't refuse a duplicate label — verified against the oracle
+                // (`sed ':lbl;:lbl'` compiles and runs with no error at all). A later
+                // definition simply overwrites the map entry, the same as this insert already
+                // did before this comment; only the refusal itself was wrong.
                 context.label_to_command_map.insert(label, rc_cmd.clone());
             }
 
@@ -1801,6 +1802,15 @@ fn get_cmd_spec(
             handler: compile_empty_command,
         }),
         'z' if !posix => Ok(CommandSpec {
+            n_addr: 2,
+            handler: compile_empty_command,
+        }),
+        // L (an obsolete GNU line-wrapping command) is still recognized by GNU's own compiler
+        // — refusing it as "unknown command" would be wrong — but its execution was removed
+        // long ago, so *running* it (not just compiling it) fails with GNU's own internal-error
+        // message (see the 'L' runtime arm) — verified against the oracle for compiling with
+        // one or two addresses and for --posix, where it isn't recognized at all.
+        'L' if !posix => Ok(CommandSpec {
             n_addr: 2,
             handler: compile_empty_command,
         }),
@@ -3413,21 +3423,24 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_label_gives_error() {
+    fn test_duplicate_label_is_accepted_and_the_later_one_wins() {
+        // GNU doesn't refuse a duplicate label — verified against the oracle
+        // (`sed ':lbl;:lbl'` compiles and runs with no error).
         let a1 = command_with_data(CommandData::Label(Some("dup".to_string())));
         a1.borrow_mut().code = ':';
 
         let a2 = command_with_data(CommandData::Label(Some("dup".to_string())));
         a2.borrow_mut().code = ':';
+        let a2_ptr = Rc::as_ptr(&a2);
 
         let head = link_commands(vec![a1, a2]);
         let mut context = ProcessingContext::default();
 
         let result = populate_label_map(head, &mut context);
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("duplicate label `dup'"));
+        assert!(result.is_ok(), "{result:?}");
+        let mapped = context.label_to_command_map.get("dup").unwrap();
+        assert_eq!(Rc::as_ptr(mapped), a2_ptr);
     }
 
     // populate_range_commands

@@ -2463,11 +2463,12 @@ fn test_invalid_backreference() {
 
 #[test]
 fn test_duplicate_label() {
+    // GNU doesn't refuse a duplicate label — verified against the oracle.
     new_ucmd!()
         .args(&[":foo;:foo"])
-        .fails()
-        .code_is(1)
-        .stderr_is("sed: -e expression #1, char 6: duplicate label `foo'\n");
+        .pipe_in("a\n")
+        .succeeds()
+        .stdout_is("a\n");
 }
 
 #[test]

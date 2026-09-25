@@ -26,7 +26,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::rc::Rc;
-use uucore::error::{UResult, set_exit_code};
+use uucore::error::{UResult, USimpleError, set_exit_code};
 
 /// Return the specified command variant or panic.
 // Example: let path = extract_variant!(command, Path);
@@ -1053,6 +1053,17 @@ pub fn process_line(
                     // so automatic printing still emits an empty record.
                     let (pat_content, _) = pattern.fields_mut()?;
                     pat_content.clear();
+                }
+                'L' => {
+                    // GNU still compiles 'L' (an obsolete line-wrapping command) but removed its
+                    // implementation long ago; actually reaching it fails with GNU's own bare
+                    // internal-error text — no location prefix, unlike every other error here —
+                    // verified against the oracle (`sed '1,2L'` on real input: status 4,
+                    // "sed: INTERNAL ERROR: Bad cmd L").
+                    return Err(USimpleError::new(
+                        4,
+                        "INTERNAL ERROR: Bad cmd L".to_string(),
+                    ));
                 }
                 ':' => {
                     // Branch target; do nothing.

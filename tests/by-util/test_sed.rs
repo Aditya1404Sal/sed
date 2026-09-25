@@ -2589,3 +2589,26 @@ fn test_non_posix_keeps_backslash_plus_extension() {
         .succeeds()
         .stdout_is("X+\n");
 }
+
+// FA-069: nested `{` blocks compile through several native-recursive tree walks with no
+// explicit stack. GNU sed handles thousands of levels of nesting (it doesn't recurse for
+// this at all); a plausible depth must not trap the embedder, and a truly pathological
+// depth must fail cleanly instead.
+#[test]
+fn test_deeply_nested_blocks_compile() {
+    let script = format!("{}p{}", "{".repeat(2000), "}".repeat(2000));
+    new_ucmd!()
+        .args(&[&script])
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("x\nx\n");
+}
+
+#[test]
+fn test_pathologically_nested_blocks_are_a_compile_error_not_a_crash() {
+    let script = format!("{}p{}", "{".repeat(20_000), "}".repeat(20_000));
+    new_ucmd!()
+        .args(&[&script])
+        .fails()
+        .stderr_contains("nested too deeply");
+}

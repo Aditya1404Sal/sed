@@ -30,7 +30,6 @@ use std::rc::Rc;
 
 use uucore::error::{UResult, USimpleError};
 
-
 const ERR_ADDRESS_0_USAGE: &str =
     "address 0 can only be used with ~step, a second regular expression, or a read command";
 const ERR_SANDBOX: &str = "command not allowed with --sandbox";
@@ -39,6 +38,14 @@ const ERR_NO_EXEC: &str =
 
 const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to 's'";
 const ERR_TRANSLITERATION_LENGTH: &str = "transliteration strings are not the same length";
+// Every `{` recurses once through `compile_sequence`, and the tree passes that walk
+// four more times (`populate_label_map`, `populate_range_commands`,
+// `resolve_branch_targets`, `patch_block_endings`), all native recursion with no
+// explicit stack. GNU sed's own compiler doesn't recurse for nesting and so has no
+// comparable limit; this cap turns an embedder-fatal stack overflow on a pathological
+// script into a clean compile error, well above any script a person would write by hand.
+const MAX_BLOCK_NESTING: usize = 4096;
+const ERR_BLOCK_NESTING_TOO_DEEP: &str = "`{' blocks are nested too deeply";
 
 // Handling required after processing a command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,7 +476,13 @@ fn compile_address(
             } else {
                 RegexMode::Basic
             };
-            let re = parse_regex_for_mode(lines, line, regex_mode, context.character_mode, context.posix)?;
+            let re = parse_regex_for_mode(
+                lines,
+                line,
+                regex_mode,
+                context.character_mode,
+                context.posix,
+            )?;
             // Skip over delimiter
             line.advance();
 
@@ -863,7 +876,13 @@ fn compile_subst_command(
     } else {
         RegexMode::Basic
     };
-    let pattern = parse_regex_for_mode(lines, line, regex_mode, context.character_mode, context.posix)?;
+    let pattern = parse_regex_for_mode(
+        lines,
+        line,
+        regex_mode,
+        context.character_mode,
+        context.posix,
+    )?;
     let mut subst = Box::new(Substitution::default());
 
     subst.replacement = compile_replacement(lines, line, context.character_mode)?;
@@ -1175,6 +1194,9 @@ fn compile_block_command(
 ) -> UResult<CommandHandling> {
     line.advance(); // move past '{'
     context.parsed_block_nesting += 1;
+    if context.parsed_block_nesting > MAX_BLOCK_NESTING {
+        return compilation_error(lines, line, ERR_BLOCK_NESTING_TOO_DEEP);
+    }
     let block_body = compile_sequence(lines, line, context)?;
     cmd.data = CommandData::BranchTarget(block_body);
     Ok(CommandHandling::Continue)

@@ -798,11 +798,13 @@ fn test_subst_flags_pe_print_then_execute() {
 
 #[test]
 fn test_subst_e_flag_rejected_with_posix() {
-    // e flag is rejected at compile time if --posix or --sandbox is provided.
+    // GNU's own wording, verified against the oracle: --posix doesn't know the `e` flag exists
+    // at all, so it's rejected the same as any other unrecognized flag — a dedicated "not
+    // allowed" refusal is --sandbox's own, tested separately below.
     new_ucmd!()
         .args(&["--posix", "s/.*/echo hi/e"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("unknown option to `s'");
 }
 
 #[test]
@@ -810,7 +812,7 @@ fn test_subst_e_flag_rejected_with_sandbox() {
     new_ucmd!()
         .args(&["--sandbox", "s/.*/echo hi/e"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 }
 
 #[test]
@@ -1033,10 +1035,13 @@ fn test_e_command_dangling_backslash_falls_back_to_no_arg() {
 
 #[test]
 fn test_e_command_rejected_with_posix() {
+    // GNU's own wording, verified against the oracle: --posix simply doesn't recognize `e` as a
+    // command at all (a GNU extension entirely absent under --posix), the same as any other
+    // GNU-only command letter — --sandbox's own dedicated refusal is tested separately below.
     new_ucmd!()
         .args(&["--posix", "e echo hi"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("unknown command: `e'");
 }
 
 #[test]
@@ -1044,7 +1049,7 @@ fn test_e_command_rejected_with_sandbox() {
     new_ucmd!()
         .args(&["--sandbox", "e echo hi"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 }
 
 #[cfg(unix)]

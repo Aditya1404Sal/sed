@@ -1171,13 +1171,17 @@ pub fn compile_subst_flags(
                 line.advance();
             }
 
+            // GNU's own two messages here are not one shared "not allowed with --posix or
+            // --sandbox" text — verified against the oracle: `--posix s/a/b/e` gives the plain
+            // `` unknown option to `s' `` any unrecognized flag gets (posix simply doesn't know
+            // the `e` flag exists, no special-cased refusal), while `--sandbox s/a/b/e` gives
+            // the dedicated sandbox message.
+            'e' if posix => {
+                return compilation_error(lines, line, ERR_UNKNOWN_OPTION_TO_S);
+            }
             'e' => {
-                if posix || sandbox {
-                    return compilation_error(
-                        lines,
-                        line,
-                        "the 'e' substitute flag is not allowed with --posix or --sandbox",
-                    );
+                if sandbox {
+                    return compilation_error(lines, line, ERR_SANDBOX);
                 }
                 subst.execute = true;
                 line.advance();
@@ -1657,12 +1661,11 @@ fn compile_execute_command(
     cmd: &mut Command,
     context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
-    if context.posix || context.sandbox {
-        return compilation_error(
-            lines,
-            line,
-            "the 'e' command is not allowed with --posix or --sandbox",
-        );
+    // --posix already keeps this function from ever being reached (get_cmd_spec's 'e' entry is
+    // `if !posix`, so an --posix script reports "unknown command" instead); only --sandbox is
+    // checked here, with GNU's own dedicated sandbox wording.
+    if context.sandbox {
+        return compilation_error(lines, line, ERR_SANDBOX);
     }
     if context.no_exec {
         return compilation_error(lines, line, ERR_NO_EXEC);
@@ -1859,8 +1862,12 @@ fn get_cmd_spec(
             n_addr: 1,
             handler: compile_number_command,
         }),
-        // e is a GNU extension
-        'e' => Ok(CommandSpec {
+        // e is a GNU extension, and --posix disables it the same way it disables every other
+        // GNU-only command: it simply isn't recognized — verified against the oracle
+        // (`--posix '1e echo hi'` -> `` unknown command: `e' ``, not a dedicated "not allowed
+        // with --posix" refusal, which is reserved for --sandbox, still checked inside
+        // `compile_execute_command`).
+        'e' if !posix => Ok(CommandSpec {
             n_addr: 2,
             handler: compile_execute_command,
         }),
@@ -2908,14 +2915,14 @@ mod tests {
 
     #[test]
     fn test_compile_subst_flag_e_rejected_under_posix() {
+        // GNU's own wording, verified against the oracle: --posix gives the plain "unknown
+        // option to `s'" any unrecognized flag gets, not a dedicated "not allowed" refusal —
+        // that wording is reserved for --sandbox, tested separately below.
         let (lines, mut chars) = make_providers("e");
         let mut subst = Substitution::default();
 
         let err = compile_subst_flags(&lines, &mut chars, &mut subst, true, false).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("not allowed with --posix or --sandbox")
-        );
+        assert!(err.to_string().contains("unknown option to `s'"));
     }
 
     #[test]
@@ -2926,7 +2933,7 @@ mod tests {
         let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, true).unwrap_err();
         assert!(
             err.to_string()
-                .contains("not allowed with --posix or --sandbox")
+                .contains("e/r/w commands disabled in sandbox mode")
         );
     }
 

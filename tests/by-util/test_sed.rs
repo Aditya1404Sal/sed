@@ -2478,11 +2478,14 @@ fn test_duplicate_label() {
 
 #[test]
 fn test_undefined_label() {
+    // GNU's own wording, status, and lack of a `-e expression #N, char C:` location prefix —
+    // verified against the oracle. An unresolved branch target is a late-binding setup failure
+    // (status 4), not a script syntax error.
     new_ucmd!()
         .args(&["b foo"])
         .fails()
-        .code_is(1)
-        .stderr_is("sed: -e expression #1, char 1: undefined label `foo'\n");
+        .code_is(4)
+        .stderr_is("sed: can't find label for jump to `foo'\n");
 }
 
 #[test]

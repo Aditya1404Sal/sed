@@ -18,7 +18,7 @@ use crate::sed::delimited_parser::{
     push_escaped_char,
 };
 use crate::sed::error_handling::{
-    ScriptLocation, compilation_error, location_prefix, remap_unterminated, semantic_error,
+    ScriptLocation, compilation_error, location_prefix, remap_unterminated,
 };
 use crate::sed::fast_regex::Regex;
 use crate::sed::named_reader::NamedReader;
@@ -277,11 +277,17 @@ fn resolve_branch_targets(
                             .get(&label)
                             .cloned()
                             .ok_or_else(|| {
-                                semantic_error::<()>(
-                                    &cmd.location,
-                                    format!("undefined label `{label}'"),
+                                // GNU's own wording, exit status, and lack of any `-e expression
+                                // #N, char C:` location prefix — verified against the oracle for
+                                // b, t and T. Unlike every other error this fork raises for a
+                                // script problem, GNU doesn't treat an unresolved branch target
+                                // as a script *syntax* error (status 1, tied to where it was
+                                // written); it's a late-binding setup failure, the same status-4
+                                // family as a missing -f file or -i with no input files.
+                                USimpleError::new(
+                                    4,
+                                    format!("can't find label for jump to `{label}'"),
                                 )
-                                .unwrap_err()
                             })?;
                         CommandData::BranchTarget(Some(target))
                     }
@@ -3613,15 +3619,20 @@ mod tests {
 
     #[test]
     fn test_branch_target_missing_label_gives_error() {
+        // GNU's own wording and status — verified against the oracle: this is a late-binding
+        // setup failure (status 4, no location prefix), not a script syntax error.
         let branch = command_with_data(CommandData::Label(Some("nope".to_string())));
         branch.borrow_mut().code = 't';
 
         let mut context = ProcessingContext::default();
         let result = resolve_branch_targets(Some(branch), &mut context);
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("undefined label `nope'"));
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), 4);
+        assert!(
+            err.to_string()
+                .contains("can't find label for jump to `nope'")
+        );
     }
 
     #[test]

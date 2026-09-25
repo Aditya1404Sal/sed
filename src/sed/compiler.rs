@@ -1240,6 +1240,16 @@ fn compile_read_file_command(
         return compilation_error(lines, line, ERR_SANDBOX);
     }
     let path = read_file_path(lines, line)?;
+    // Unlike `w`/`R`, which open their file right away, `r`'s file is only read when the
+    // command runs — possibly long after compilation, and (for an embedder) possibly
+    // against a process working directory that no longer matches whatever was current
+    // when this script was compiled. Make the path absolute now, against the directory
+    // that is current right now, so a later read isn't at the mercy of that.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(&path))
+    };
     cmd.data = CommandData::Path(path);
     Ok(CommandHandling::Continue)
 }
@@ -3173,6 +3183,37 @@ mod tests {
         let err =
             compile_read_file_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
         assert!(err.to_string().contains(ERR_SANDBOX));
+    }
+
+    #[test]
+    // FB-021: `r`'s file is opened when the command *runs*, which for an embedder may be
+    // long after (and so against a different process directory than) when the script was
+    // compiled. Resolving to an absolute path at compile time, while the directory is
+    // still the right one, keeps the later read from landing in the wrong place.
+    fn test_compile_read_file_command_resolves_a_relative_path_to_absolute() {
+        let (mut lines, mut chars) = make_providers("r input.txt");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        compile_read_file_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
+        let CommandData::Path(path) = &cmd.data else {
+            panic!("expected CommandData::Path, got {:?}", cmd.data);
+        };
+        assert!(path.is_absolute(), "{path:?} is not absolute");
+        assert_eq!(path.file_name().unwrap(), "input.txt");
+    }
+
+    #[test]
+    fn test_compile_read_file_command_leaves_an_absolute_path_alone() {
+        let (mut lines, mut chars) = make_providers("r /already/absolute.txt");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        compile_read_file_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
+        let CommandData::Path(path) = &cmd.data else {
+            panic!("expected CommandData::Path, got {:?}", cmd.data);
+        };
+        assert_eq!(path, std::path::Path::new("/already/absolute.txt"));
     }
 
     // compile_write_file_command

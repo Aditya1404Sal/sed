@@ -363,6 +363,11 @@ pub fn parse_regex(
 }
 
 /// Parse a regular expression according to the current character mode.
+// One character-dispatch loop reading GNU's BRE and ERE dialects (word-boundary escapes,
+// `--posix` extension toggling, `{m,n}` intervals, stacked-quantifier detection) in one
+// pass, so the two dialects' handling for each construct sits next to each other rather
+// than in separate, drifting copies.
+#[allow(clippy::cognitive_complexity)]
 pub fn parse_regex_for_mode(
     lines: &ScriptLineProvider,
     line: &mut ScriptCharProvider,
@@ -372,7 +377,19 @@ pub fn parse_regex_for_mode(
 ) -> UResult<Vec<u8>> {
     let delimiter = scan_delimiter(lines, line)?;
     let mut result = Vec::new();
+    // POSIX has no lazy quantifiers, so a `?`/`\?` stacked straight onto a quantifier
+    // that was just emitted (`a+?`, `a\{2,3\}\?`, a bare `*` followed by `?`, ...) is a
+    // no-op re-quantification in GNU, not Perl-style laziness — which is what it would
+    // read as if passed through unchanged, since the underlying RE engine (`regex`/
+    // `fancy_regex`) gives `+`/`*`/`?`/`{m,n}` their usual Rust-regex meaning either way.
+    let mut just_quantified = false;
+    // Between a `{`/`\{` that opened a recognized `{m,n}` interval and its closing
+    // `}`/`\}` — so that closing brace only counts as "just quantified" when it's really
+    // closing one, not when it's a literal brace.
+    let mut in_interval = false;
     while !line.eol() {
+        let quantified = just_quantified;
+        just_quantified = false;
         match line.current() {
             '[' if delimiter != '[' => {
                 let cc = parse_character_class(lines, line, character_mode)?;
@@ -404,12 +421,33 @@ pub fn parse_regex_for_mode(
                     result.push(b'\\');
                     result.push(b'{');
                     result.extend_from_slice(quantifier.as_bytes());
+                    in_interval = true;
                     continue;
                 }
                 if line.current() == '}' {
                     result.push(b'\\');
                     result.push(b'}');
                     line.advance();
+                    if in_interval {
+                        in_interval = false;
+                        just_quantified = true;
+                    }
+                    continue;
+                }
+                if line.current() == '+' {
+                    result.push(b'\\');
+                    result.push(b'+');
+                    line.advance();
+                    just_quantified = true;
+                    continue;
+                }
+                if line.current() == '?' {
+                    if !quantified {
+                        result.push(b'\\');
+                        result.push(b'?');
+                    } // else: redundant — drop it rather than let it read as lazy.
+                    line.advance();
+                    just_quantified = true;
                     continue;
                 }
                 // GNU word-boundary escapes are RE assertions, not character escapes:
@@ -447,11 +485,36 @@ pub fn parse_regex_for_mode(
                 let quantifier = validate_quantifier_numbers(lines, line)?;
                 result.push(b'{');
                 result.extend_from_slice(quantifier.as_bytes());
+                in_interval = true;
                 continue;
             }
             '}' if delimiter != '}' => {
                 result.push(b'}');
                 line.advance();
+                if in_interval {
+                    in_interval = false;
+                    just_quantified = true;
+                }
+                continue;
+            }
+            '*' if delimiter != '*' => {
+                result.push(b'*');
+                line.advance();
+                just_quantified = true;
+                continue;
+            }
+            '+' if delimiter != '+' && matches!(regex_mode, RegexMode::Extended) => {
+                result.push(b'+');
+                line.advance();
+                just_quantified = true;
+                continue;
+            }
+            '?' if delimiter != '?' && matches!(regex_mode, RegexMode::Extended) => {
+                if !quantified {
+                    result.push(b'?');
+                } // else: redundant — drop it rather than let it read as lazy.
+                line.advance();
+                just_quantified = true;
                 continue;
             }
 
@@ -1167,6 +1230,52 @@ mod tests {
         let parsed = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap();
         assert_eq!(parsed, b"a{2,3}");
         assert_eq!(line.current(), '/');
+    }
+
+    #[test]
+    // FB-067: `?` stacked onto a quantifier is a redundant no-op in GNU, not the lazy
+    // modifier it would read as if passed straight through to the RE engine.
+    fn test_extended_regex_drops_redundant_question_mark_after_quantifier() {
+        let (lines, mut line) = make_providers("/a+?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a+"
+        );
+        let (lines, mut line) = make_providers("/a*?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a*"
+        );
+        let (lines, mut line) = make_providers("/a??/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a?"
+        );
+        let (lines, mut line) = make_providers("/a{2,3}?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a{2,3}"
+        );
+        // A `?` that is NOT immediately after a quantifier stays a real quantifier.
+        let (lines, mut line) = make_providers("/ab?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"ab?"
+        );
+    }
+
+    #[test]
+    fn test_basic_regex_drops_redundant_question_mark_after_quantifier() {
+        let (lines, mut line) = make_providers(r"/a\+\?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
+            br"a\+"
+        );
+        let (lines, mut line) = make_providers(r"/a\{2,3\}\?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
+            br"a\{2,3\}"
+        );
     }
 
     #[test]

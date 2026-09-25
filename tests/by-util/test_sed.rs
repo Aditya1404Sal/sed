@@ -2612,3 +2612,29 @@ fn test_pathologically_nested_blocks_are_a_compile_error_not_a_crash() {
         .fails()
         .stderr_contains("nested too deeply");
 }
+
+// FA-076: GNU's `R` command queues one line from a file per invocation (unlike `r`,
+// which queues the whole file), and a missing file behaves as empty, not an error.
+#[test]
+fn test_r_capital_reads_one_line_per_invocation() -> std::io::Result<()> {
+    let temp = NamedTempFile::new()?;
+    write!(temp.as_file(), "x\ny\nz\n")?;
+    let cmd = format!("R {}", temp.path().display());
+
+    new_ucmd!()
+        .args(&["-e", &cmd])
+        .pipe_in("a\nb\nc\nd\n")
+        .succeeds()
+        .stdout_is("a\nx\nb\ny\nc\nz\nd\n");
+    Ok(())
+}
+
+#[test]
+fn test_r_capital_missing_file_is_silently_empty() {
+    let cmd = "R /nonexistent/does-not-exist-either";
+    new_ucmd!()
+        .args(&["-e", cmd])
+        .pipe_in("a\nb\n")
+        .succeeds()
+        .stdout_is("a\nb\n");
+}

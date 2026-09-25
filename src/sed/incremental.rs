@@ -102,6 +102,13 @@ impl Engine {
         self.needs_last
     }
 
+    /// Tell the engine which file the next record it's handed comes from, for the `F`
+    /// command. Addressing (line numbers, `$`) still spans every operand as one stream,
+    /// as GNU sed does without `-s`: only this display name changes at a file boundary.
+    pub fn set_input_name(&mut self, name: impl Into<PathBuf>) {
+        self.context.input_name = name.into();
+    }
+
     /// Process one input line, including its delimiter if present, and
     /// append the resulting output to `out`.
     pub fn record(&mut self, line: &[u8], is_last: bool, out: &mut Vec<u8>) -> UResult<Flow> {
@@ -254,6 +261,19 @@ mod tests {
         assert_eq!(run(&["s/h./H/"], "héllo\n").0, "Hllo\n");
         assert_eq!(run(&["-E", r"s/(ab)\1/X/"], "abab\n").0, "X\n");
         crate::sed::set_locale(None);
+    }
+
+    #[test]
+    fn set_input_name_changes_what_f_prints() {
+        let argv = ["sed", "F"].map(std::ffi::OsString::from);
+        let (mut engine, _) = Engine::new(argv.into_iter()).unwrap();
+        let mut out = Vec::new();
+        engine.set_input_name("a.txt");
+        engine.record(b"1\n", false, &mut out).unwrap();
+        engine.set_input_name("b.txt");
+        engine.record(b"2\n", true, &mut out).unwrap();
+        engine.finish(&mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a.txt\n1\nb.txt\n2\n");
     }
 
     #[test]

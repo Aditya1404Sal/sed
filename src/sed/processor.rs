@@ -944,6 +944,17 @@ pub fn process_line(
                         .append_elements
                         .push(AppendElement::Path(path.clone()));
                 }
+                'R' => {
+                    // Queue one more line from the file at a later point. A read error
+                    // (the file vanishing mid-run, say) is treated the same as running out
+                    // of lines: nothing is queued, same as GNU sed's "missing file" case.
+                    let reader = extract_variant!(command, NamedReader);
+                    if let Ok(Some(line)) = reader.borrow_mut().next_line() {
+                        context
+                            .append_elements
+                            .push(AppendElement::Text(line.into()));
+                    }
+                }
                 's' => {
                     substitute(&mut pattern, &command, context, output)?;
                 }

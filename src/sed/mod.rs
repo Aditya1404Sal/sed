@@ -16,6 +16,7 @@ pub mod fast_io;
 pub mod fast_regex;
 pub mod in_place;
 pub mod incremental;
+pub mod named_reader;
 pub mod named_writer;
 pub mod processor;
 pub mod script_char_provider;

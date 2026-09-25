@@ -40,7 +40,7 @@ impl ScriptLocation {
     pub fn at_position(lines: &ScriptLineProvider, line: &ScriptCharProvider) -> Self {
         ScriptLocation {
             line_number: lines.get_line_number(),
-            column_number: line.get_pos() + 1,
+            column_number: char_column(line),
             input_name: Rc::from(lines.get_input_name()),
         }
     }
@@ -56,7 +56,7 @@ impl ScriptLocation {
 /// `<script argument N>` marker (`advance_source`, `script_line_provider.rs`) for exactly this
 /// case; anything else (a `-f` script file) falls back to the pre-existing, generic
 /// `name:line:col: error` form, since GNU's own file-sourced wording hasn't been verified here.
-fn location_prefix(input_name: &str, line_number: usize, column: usize) -> String {
+pub(crate) fn location_prefix(input_name: &str, line_number: usize, column: usize) -> String {
     match input_name
         .strip_prefix("<script argument ")
         .and_then(|rest| rest.strip_suffix('>'))
@@ -80,11 +80,23 @@ pub fn compilation_error<T>(
             location_prefix(
                 lines.get_input_name(),
                 lines.get_line_number(),
-                line.get_pos() + 1,
+                char_column(line)
             ),
             msg.to_string()
         ),
     ))
+}
+
+/// The 1-based column `compilation_error`/`location_error` report: `line.get_pos() + 1`
+/// (the position of the character about to be read) everywhere except at end of line, where
+/// GNU's own column never runs past the line's own length — verified against the oracle
+/// (`sed 's/a/b'`, 5 characters, error `char 5`, not `char 6`).
+fn char_column(line: &ScriptCharProvider) -> usize {
+    if line.eol() {
+        line.get_pos()
+    } else {
+        line.get_pos() + 1
+    }
 }
 
 /// Fail with msg as a compilation error at the command's location.
@@ -138,4 +150,26 @@ pub fn input_runtime_error<T>(
             msg.to_string()
         ),
     ))
+}
+
+/// Replace a `compilation_error`'s own generic message with a context-specific one, keeping
+/// its location prefix and exit code — used where `parse_regex_for_mode`/`parse_character_class`
+/// raise the same "unterminated regular expression"/"Unterminated bracket expression" whether
+/// they were called for a command address or an `s` command's pattern, but GNU's own wording
+/// for hitting end of input differs by which one it was (verified against the oracle:
+/// `sed '/unterminated'` -> "unterminated address regex", `sed 's/a'` -> `` unterminated `s'
+/// command ``, both including for an unterminated bracket expression within the regex).
+pub fn remap_unterminated<T>(result: UResult<T>, replacement: &str) -> UResult<T> {
+    result.map_err(|error| {
+        let message = error.to_string();
+        for generic in [
+            "unterminated regular expression",
+            "Unterminated bracket expression",
+        ] {
+            if let Some(prefix) = message.strip_suffix(generic) {
+                return USimpleError::new(1, format!("{prefix}{replacement}"));
+            }
+        }
+        error
+    })
 }

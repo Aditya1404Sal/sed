@@ -1420,7 +1420,7 @@ fn pattern_clear_with_z_is_non_posix() {
         .args(&["--posix", "z"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 1: invalid command code `z'\n");
+        .stderr_is("sed: -e expression #1, char 1: unknown command: `z'\n");
 }
 check_output!(trans_newline, ["-e", r"1N;2y/\n/X/", LINES1]);
 
@@ -1757,7 +1757,7 @@ fn test_branch_no_sub_non_posix() {
         .args(&["--posix", "T"])
         .fails()
         .code_is(1)
-        .stderr_contains("invalid command code");
+        .stderr_contains("unknown command");
 }
 
 ////////////////////////////////////////////////////////////
@@ -1946,7 +1946,7 @@ fn sandbox_rejects_read_command() {
     new_ucmd!()
         .args(&["--sandbox", &format!("1r {LINES2}"), LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 }
 
 #[test]
@@ -1957,7 +1957,7 @@ fn sandbox_rejects_subst_write_flag() -> std::io::Result<()> {
     new_ucmd!()
         .args(&["--sandbox", &cmd, LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 
     let mut actual = String::new();
     temp.reopen()?.read_to_string(&mut actual)?;
@@ -1974,7 +1974,7 @@ fn sandbox_rejects_write_command() -> std::io::Result<()> {
     new_ucmd!()
         .args(&["--sandbox", &cmd, LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 
     let mut actual = String::new();
     temp.reopen()?.read_to_string(&mut actual)?;
@@ -1991,7 +1991,7 @@ fn sandbox_rejects_first_line_write_command() -> std::io::Result<()> {
     new_ucmd!()
         .args(&["--sandbox", &cmd, LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 
     let mut actual = String::new();
     temp.reopen()?.read_to_string(&mut actual)?;
@@ -2100,7 +2100,7 @@ fn write_first_line_with_w_command_is_non_posix() {
         .args(&["--posix", "W /tmp/out"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 1: invalid command code `W'\n");
+        .stderr_is("sed: -e expression #1, char 1: unknown command: `W'\n");
 }
 
 ////////////////////////////////////////////////////////////
@@ -2132,7 +2132,7 @@ fn filename_non_posix() {
         .args(&["--posix", "F"])
         .fails()
         .code_is(1)
-        .stderr_contains("invalid command code");
+        .stderr_contains("unknown command");
 }
 
 /// List Unicode input under an explicit UTF-8 locale
@@ -2485,7 +2485,7 @@ fn test_incomplete_test_command_posix() {
         .args(&["--posix", "i\\"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 3: incomplete command\n");
+        .stderr_is("sed: -e expression #1, char 2: incomplete command\n");
 }
 
 #[test]
@@ -2495,7 +2495,7 @@ fn test_empty_text_commands_fail() {
             .args(&["-e", command])
             .fails()
             .code_is(1)
-            .stderr_contains(format!("command `{command}' expects \\ followed by text"));
+            .stderr_contains("expected \\ after `a', `c' or `i'");
     }
 }
 
@@ -2698,7 +2698,7 @@ fn test_expected_newer_version() {
     new_ucmd!()
         .args(&["v4.10"])
         .fails()
-        .stderr_is("sed: -e expression #1, char 6: expected newer version of sed\n");
+        .stderr_is("sed: -e expression #1, char 5: expected newer version of sed\n");
 }
 
 #[test]
@@ -2706,7 +2706,7 @@ fn test_invalid_version() {
     new_ucmd!()
         .args(&["v4.a"])
         .fails()
-        .stderr_is("sed: -e expression #1, char 5: invalid version of sed\n");
+        .stderr_is("sed: -e expression #1, char 4: invalid version of sed\n");
 }
 
 #[test]
@@ -2726,7 +2726,7 @@ fn test_invalid_only_major_version() {
     new_ucmd!()
         .args(&["v999"])
         .fails()
-        .stderr_is("sed: -e expression #1, char 5: invalid version of sed\n");
+        .stderr_is("sed: -e expression #1, char 4: invalid version of sed\n");
 }
 
 #[test]
@@ -2742,13 +2742,13 @@ fn test_posix_reject_flags() {
         .args(&["--posix", "s/a/b/i"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 7: unknown option to 's'\n");
+        .stderr_is("sed: -e expression #1, char 7: unknown option to `s'\n");
 
     new_ucmd!()
         .args(&["--posix", "s/a/b/m"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 7: unknown option to 's'\n");
+        .stderr_is("sed: -e expression #1, char 7: unknown option to `s'\n");
 }
 
 // GNU word-boundary escapes are RE assertions, not the C `\b` (backspace) character

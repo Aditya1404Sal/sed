@@ -2489,3 +2489,36 @@ fn test_posix_reject_flags() {
         .code_is(1)
         .stderr_is("sed: <script argument 1>:1:7: error: unknown option to 's'\n");
 }
+
+// GNU word-boundary escapes are RE assertions, not the C `\b` (backspace) character
+// escape. FB-022/FA-072: `\b`, `\<` and `\>` used to never match.
+#[test]
+fn test_word_boundary_escape() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&[r"s/\bcat\b/dog/g"])
+        .pipe_in("cat catalog cat\n")
+        .succeeds()
+        .stdout_is("dog catalog dog\n");
+}
+
+#[test]
+fn test_word_start_end_escapes() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-E", r"s/\<old_name\>/new_name/g"])
+        .pipe_in("old_name and old_name2\n")
+        .succeeds()
+        .stdout_is("new_name and old_name2\n");
+}
+
+// Byte mode (the plain `C`/`POSIX` locale) can't run the lookaround `\<`/`\>` need,
+// for the same reason it already can't run back-references: fancy_regex requires
+// valid UTF-8 text. It must refuse with a clear error, not silently mismatch.
+#[test]
+fn test_word_start_end_escapes_refuse_in_byte_mode() {
+    new_ucmd!()
+        .env("LC_ALL", "C")
+        .args(&["-E", r"s/\<old_name\>/new_name/"])
+        .pipe_in("old_name\n")
+        .fails()

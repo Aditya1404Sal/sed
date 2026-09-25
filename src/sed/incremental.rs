@@ -62,7 +62,20 @@ impl Engine {
     /// script. Returns the engine and its input operands; `-` names
     /// standard input. The `e` command and `s///e` flag are refused.
     pub fn new(args: impl uucore::Args) -> UResult<(Self, Vec<PathBuf>)> {
-        let matches = uu_app().try_get_matches_from(normalize_in_place(args))?;
+        // FB-077: a bare `?` here would let `clap::Error` auto-convert into uucore's own
+        // `ClapErrorWrapper` (`impl From<clap::Error> for Box<dyn UError>`) — whose `Display`
+        // impl calls `clap::Error::print()` as a side effect (its own doc comment: "this is
+        // abuse of the Display trait"). `print()` writes straight to the real process
+        // stdout/stderr, bypassing whatever redirection or capture the embedder set up for
+        // this call entirely — `--help`/`--version` text (and any usage error) leaks out
+        // unredirected and unpiped, and the message `Display` actually returns is empty.
+        // `clap::Error`'s own `Display` has no such side effect, so build the message from
+        // that instead, before the wrapper ever gets a chance to.
+        let matches = uu_app()
+            .try_get_matches_from(normalize_in_place(args))
+            .map_err(|error| {
+                uucore::error::USimpleError::new(error.exit_code(), error.to_string())
+            })?;
         let (scripts, files) = get_scripts_files(&matches)?;
         let mut context = build_context(&matches)?;
         context.no_exec = true;

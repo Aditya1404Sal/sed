@@ -46,6 +46,26 @@ impl ScriptLocation {
     }
 }
 
+/// GNU's own location prefix for a diagnostic tied to a specific point in the script source,
+/// without the trailing `: ` before the message text — verified against the oracle:
+/// `-e expression #1, char 5: unterminated `s' command` for the first `-e` (or the
+/// first-POSIX-form positional script argument, which GNU labels the same way), or
+/// `-e expression #2, char 4: ...` for a later `-e`, each with its own 1-based char column
+/// (not a running total across `-e`s, and no line number at all — GNU only counts characters
+/// within the one expression). `input_name` here is `ScriptLineProvider::get_input_name`'s own
+/// `<script argument N>` marker (`advance_source`, `script_line_provider.rs`) for exactly this
+/// case; anything else (a `-f` script file) falls back to the pre-existing, generic
+/// `name:line:col: error` form, since GNU's own file-sourced wording hasn't been verified here.
+fn location_prefix(input_name: &str, line_number: usize, column: usize) -> String {
+    match input_name
+        .strip_prefix("<script argument ")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        Some(index) => format!("-e expression #{index}, char {column}"),
+        None => format!("{input_name}:{line_number}:{column}: error"),
+    }
+}
+
 /// Fail with msg as a compile error at the provider location.
 /// The error's exit code is 1 (compilation phase).
 pub fn compilation_error<T>(
@@ -56,10 +76,12 @@ pub fn compilation_error<T>(
     Err(USimpleError::new(
         1,
         format!(
-            "{}:{}:{}: error: {}",
-            lines.get_input_name(),
-            lines.get_line_number(),
-            line.get_pos() + 1,
+            "{}: {}",
+            location_prefix(
+                lines.get_input_name(),
+                lines.get_line_number(),
+                line.get_pos() + 1,
+            ),
             msg.to_string()
         ),
     ))
@@ -71,10 +93,12 @@ fn location_error<T>(location: &ScriptLocation, msg: impl ToString, exit_code: i
     Err(USimpleError::new(
         exit_code,
         format!(
-            "{}:{}:{}: error: {}",
-            location.input_name,
-            location.line_number,
-            location.column_number,
+            "{}: {}",
+            location_prefix(
+                &location.input_name,
+                location.line_number,
+                location.column_number,
+            ),
             msg.to_string()
         ),
     ))

@@ -34,6 +34,15 @@ pub enum ScriptValue {
 pub struct ScriptLineProvider {
     sources: Vec<ScriptValue>,
     state: State,
+    /// The last `Active` source's own name and line number, kept once `state` has moved past
+    /// it (to the next source, or to `Done`) — so a caller reporting "unterminated" once
+    /// `next_line` finally returns `None` still names the source that ran out, instead of the
+    /// no-current-source defaults `get_input_name`/`get_line_number` would otherwise fall back
+    /// to. Verified against the oracle: GNU's own "-e expression #1, char 5: unterminated `s'
+    /// command" still names expression #1 even though, by the time it's reported, `-e` #1's
+    /// content has already been entirely consumed.
+    last_input_name: String,
+    last_line_number: usize,
 }
 
 /// Encapsulation of the script line provider's state
@@ -54,22 +63,26 @@ impl ScriptLineProvider {
         Self {
             sources,
             state: State::NotStarted,
+            last_input_name: String::new(),
+            last_line_number: 0,
         }
     }
 
-    /// Return the currently processed script line number.
+    /// Return the currently processed script line number, or the last one that was active if
+    /// none is right now (see `last_line_number`'s own comment).
     pub fn get_line_number(&self) -> usize {
         match &self.state {
             State::Active { line_number, .. } => *line_number,
-            _ => 0,
+            _ => self.last_line_number,
         }
     }
 
-    /// Return the currently processed script descriptive name.
+    /// Return the currently processed script descriptive name, or the last one that was active
+    /// if none is right now (see `last_input_name`'s own comment).
     pub fn get_input_name(&self) -> &str {
         match &self.state {
             State::Active { input_name, .. } => input_name.as_str(),
-            _ => "",
+            _ => &self.last_input_name,
         }
     }
 
@@ -112,6 +125,18 @@ impl ScriptLineProvider {
 
     // Move to the next available script source.
     fn advance_source(&mut self, next_index: usize) -> UResult<()> {
+        // Remember this source's own name and line number (see `last_input_name`'s own
+        // comment) before leaving it, whether for the next source or for `Done`.
+        if let State::Active {
+            input_name,
+            line_number,
+            ..
+        } = &self.state
+        {
+            self.last_input_name.clone_from(input_name);
+            self.last_line_number = *line_number;
+        }
+
         if next_index >= self.sources.len() {
             self.state = State::Done;
             return Ok(());
@@ -184,6 +209,8 @@ impl ScriptLineProvider {
                 index: 0,
                 reader: Box::new(BufReader::new(io::stdin())),
             },
+            last_input_name: String::new(),
+            last_line_number: 0,
         }
     }
 }

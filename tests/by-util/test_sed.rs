@@ -1267,6 +1267,39 @@ fn null_data_terminates_output_records_with_nul() {
         .stdout_is_bytes(b"X\0b\0");
 }
 
+/// A compile error names its source the way GNU does: `-e expression #N, char C:` (no line
+/// number — GNU counts characters within the one expression, not lines) for both an `-e` and
+/// the first-POSIX-form positional script argument (GNU labels that "-e expression #1" too),
+/// with `N` matching the expression's own 1-based position among every `-e` given. Root cause
+/// was `ScriptLineProvider` resetting to its no-current-source defaults (empty name, line 0)
+/// the instant the source that ran out was itself the one whose exhaustion was the news — by
+/// the time `next_line` returns `None`, `advance_source` has already moved the state past it.
+/// `last_input_name`/`last_line_number` keep the last `Active` source's own location visible
+/// once that happens. Verified against the oracle for the message text on the single/`-e`
+/// forms; the second-`-e` case checks only the format and index (the oracle's own char count
+/// for that exact case wasn't independently reproduced against the same message text yet).
+#[test]
+fn compile_error_location_names_the_e_expression() {
+    new_ucmd!()
+        .args(&["-e", "s/a/b"])
+        .pipe_in("")
+        .fails()
+        .code_is(1)
+        .stderr_contains("sed: -e expression #1, char");
+    new_ucmd!()
+        .arg("s/a/b")
+        .pipe_in("")
+        .fails()
+        .code_is(1)
+        .stderr_contains("sed: -e expression #1, char");
+    new_ucmd!()
+        .args(&["-e", "s/x/y/", "-e", "s/a/b"])
+        .pipe_in("")
+        .fails()
+        .code_is(1)
+        .stderr_contains("sed: -e expression #2, char");
+}
+
 /// `N` reaching end of input on its very first, untouched attempt preserves the final line's
 /// own missing terminator — it does not gain one just because `N` never got a next line to
 /// join it with (FB-078/FA-077). Verified against the oracle.
@@ -1387,7 +1420,7 @@ fn pattern_clear_with_z_is_non_posix() {
         .args(&["--posix", "z"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:1: error: invalid command code `z'\n");
+        .stderr_is("sed: -e expression #1, char 1: invalid command code `z'\n");
 }
 check_output!(trans_newline, ["-e", r"1N;2y/\n/X/", LINES1]);
 
@@ -2067,7 +2100,7 @@ fn write_first_line_with_w_command_is_non_posix() {
         .args(&["--posix", "W /tmp/out"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:1: error: invalid command code `W'\n");
+        .stderr_is("sed: -e expression #1, char 1: invalid command code `W'\n");
 }
 
 ////////////////////////////////////////////////////////////
@@ -2425,7 +2458,7 @@ fn test_invalid_backreference() {
         .args(&["-n", "-e", r"s/./X/;s//\1/", LINES1])
         .fails()
         .code_is(2)
-        .stderr_is("sed: <script argument 1>:1:8: error: invalid reference \\1 on command's RHS\n");
+        .stderr_is("sed: -e expression #1, char 8: invalid reference \\1 on command's RHS\n");
 }
 
 #[test]
@@ -2434,7 +2467,7 @@ fn test_duplicate_label() {
         .args(&[":foo;:foo"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:6: error: duplicate label `foo'\n");
+        .stderr_is("sed: -e expression #1, char 6: duplicate label `foo'\n");
 }
 
 #[test]
@@ -2443,7 +2476,7 @@ fn test_undefined_label() {
         .args(&["b foo"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:1: error: undefined label `foo'\n");
+        .stderr_is("sed: -e expression #1, char 1: undefined label `foo'\n");
 }
 
 #[test]
@@ -2452,7 +2485,7 @@ fn test_incomplete_test_command_posix() {
         .args(&["--posix", "i\\"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: :0:3: error: incomplete command\n");
+        .stderr_is("sed: -e expression #1, char 3: incomplete command\n");
 }
 
 #[test]
@@ -2472,7 +2505,7 @@ fn test_addr0_non_posix() {
         .args(&["--posix", "0,/foo/p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:2: error: address 0 is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 2: address 0 is invalid in POSIX mode\n");
 }
 
 #[test]
@@ -2481,7 +2514,7 @@ fn test_addr0_second_required() {
         .args(&["0p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:2: error: address 0 can only be used with ~step, a second regular expression, or a read command\n");
+        .stderr_is("sed: -e expression #1, char 2: address 0 can only be used with ~step, a second regular expression, or a read command\n");
 }
 
 #[test]
@@ -2490,7 +2523,7 @@ fn test_addr0_second_re_only() {
         .args(&["0,4p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:4: error: address 0 can only be used with ~step, a second regular expression, or a read command\n");
+        .stderr_is("sed: -e expression #1, char 4: address 0 can only be used with ~step, a second regular expression, or a read command\n");
 }
 
 #[test]
@@ -2499,7 +2532,7 @@ fn test_step_match_non_posix() {
         .args(&["--posix", "3~2p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:3: error: ~step is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 3: ~step is invalid in POSIX mode\n");
 }
 
 #[test]
@@ -2508,7 +2541,7 @@ fn test_step_end_non_posix() {
         .args(&["--posix", "3,~2p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:4: error: ~step is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 4: ~step is invalid in POSIX mode\n");
 }
 
 // The following test diverse ways in which regexes are matched.
@@ -2559,7 +2592,7 @@ fn test_write_file_failure() {
         .args(&["w /xyzzy/xyzy", LINES1])
         .fails()
         .code_is(2)
-        .stderr_contains("sed: <script argument 1>:1:1: error: creating file '/xyzzy/xyzy':");
+        .stderr_contains("sed: -e expression #1, char 1: creating file '/xyzzy/xyzy':");
 }
 
 #[test]
@@ -2665,7 +2698,7 @@ fn test_expected_newer_version() {
     new_ucmd!()
         .args(&["v4.10"])
         .fails()
-        .stderr_is("sed: <script argument 1>:1:6: error: expected newer version of sed\n");
+        .stderr_is("sed: -e expression #1, char 6: expected newer version of sed\n");
 }
 
 #[test]
@@ -2673,7 +2706,7 @@ fn test_invalid_version() {
     new_ucmd!()
         .args(&["v4.a"])
         .fails()
-        .stderr_is("sed: <script argument 1>:1:5: error: invalid version of sed\n");
+        .stderr_is("sed: -e expression #1, char 5: invalid version of sed\n");
 }
 
 #[test]
@@ -2693,7 +2726,7 @@ fn test_invalid_only_major_version() {
     new_ucmd!()
         .args(&["v999"])
         .fails()
-        .stderr_is("sed: <script argument 1>:1:5: error: invalid version of sed\n");
+        .stderr_is("sed: -e expression #1, char 5: invalid version of sed\n");
 }
 
 #[test]
@@ -2709,13 +2742,13 @@ fn test_posix_reject_flags() {
         .args(&["--posix", "s/a/b/i"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:7: error: unknown option to 's'\n");
+        .stderr_is("sed: -e expression #1, char 7: unknown option to 's'\n");
 
     new_ucmd!()
         .args(&["--posix", "s/a/b/m"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:7: error: unknown option to 's'\n");
+        .stderr_is("sed: -e expression #1, char 7: unknown option to 's'\n");
 }
 
 // GNU word-boundary escapes are RE assertions, not the C `\b` (backspace) character

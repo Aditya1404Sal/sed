@@ -2604,9 +2604,25 @@ fn test_deeply_nested_blocks_compile() {
         .stdout_is("x\nx\n");
 }
 
+// `compile_sequence` parses nesting with its own heap frame stack now (not the native
+// call stack), so several times the depth GNU sed is known to handle — far beyond what
+// any hand-written script would use — compiles and runs cleanly.
+#[test]
+fn test_very_deeply_nested_blocks_compile() {
+    let script = format!("{}p{}", "{".repeat(4_000), "}".repeat(4_000));
+    new_ucmd!()
+        .args(&[&script])
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("x\nx\n");
+}
+
+// Beyond `MAX_BLOCK_NESTING`, compilation refuses cleanly rather than succeeding and
+// later overflowing the stack when the compiled command chain is dropped (`Command`'s
+// `.next`/`.data` links are still freed by the derived, recursive `Drop` glue).
 #[test]
 fn test_pathologically_nested_blocks_are_a_compile_error_not_a_crash() {
-    let script = format!("{}p{}", "{".repeat(20_000), "}".repeat(20_000));
+    let script = format!("{}p{}", "{".repeat(200_000), "}".repeat(200_000));
     new_ucmd!()
         .args(&[&script])
         .fails()

@@ -39,13 +39,15 @@ const ERR_NO_EXEC: &str =
 
 const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to 's'";
 const ERR_TRANSLITERATION_LENGTH: &str = "transliteration strings are not the same length";
-// Every `{` recurses once through `compile_sequence`, and the tree passes that walk
-// four more times (`populate_label_map`, `populate_range_commands`,
-// `resolve_branch_targets`, `patch_block_endings`), all native recursion with no
-// explicit stack. GNU sed's own compiler doesn't recurse for nesting and so has no
-// comparable limit; this cap turns an embedder-fatal stack overflow on a pathological
-// script into a clean compile error, well above any script a person would write by hand.
-const MAX_BLOCK_NESTING: usize = 4096;
+// `compile_sequence` and the post-parse tree walks (`populate_label_map` and friends)
+// all use their own heap-allocated work stacks now, not the native call stack, so this
+// cap isn't there to protect them. It exists because dropping the compiled `Command`
+// chain still isn't: `Command`'s fields (`.next`, and `.data`'s `BranchTarget`) are
+// `Rc<RefCell<Command>>`, so Rust's derived drop glue frees a deeply nested chain with
+// one native stack frame per level, which measurably overflows the WASI stack somewhere
+// between 8,000 and 10,000 levels. 5,000 is comfortably below that, and comfortably
+// above any script a person would write by hand.
+const MAX_BLOCK_NESTING: usize = 5_000;
 const ERR_BLOCK_NESTING_TOO_DEEP: &str = "`{' blocks are nested too deeply";
 
 // Handling required after processing a command
@@ -102,33 +104,39 @@ pub fn compile(
 }
 
 /// For every Command in the top-level `head` chain, look for
-/// `CommandData::BranchTarget(Some(sub_head))` '{' commands.
-/// Recursively patch the sub-chain, then splice its tail back to the
-/// original “next” pointer of the *parent* (falling back to its own
-/// parent_next if its own next was `None`).
+/// `CommandData::BranchTarget(Some(sub_head))` '{' commands, and splice each one's tail
+/// back to the original "next" pointer of its *parent* (falling back to the parent's own
+/// splice target if its own next was `None`).
+///
+/// Two passes, rather than one recursive walk that splices as it goes (deep nesting
+/// would overflow the native stack under WASI): the first only reads `.next` — including
+/// each nested block's own `own_next`, which a splice would otherwise overwrite before
+/// that block gets its turn — and records every splice this pass would have made; the
+/// second applies them. Since a splice never depends on another splice (a block's tail
+/// is only ever the target of the one enclosing splice that closes it), any order in the
+/// second pass gives the same result as the recursive original.
 fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
-    fn patch_block_endings_to_parent(
-        mut cur: Option<Rc<RefCell<Command>>>,
-        parent_next: Option<Rc<RefCell<Command>>>,
-    ) {
+    type Link = Option<Rc<RefCell<Command>>>;
+    let mut writes: Vec<(Rc<RefCell<Command>>, Link)> = Vec::new();
+    // (chain to walk, that chain's own fallback splice target)
+    let mut pending: Vec<(Link, Link)> = vec![(head, None)];
+    while let Some((mut cur, parent_next)) = pending.pop() {
         while let Some(rc_cmd) = cur {
-            // Borrow mutably just long enough to inspect/rewire this node
-            let cmd = rc_cmd.borrow_mut();
+            // A read-only borrow: this pass never mutates `.next`.
+            let cmd = rc_cmd.borrow();
             // Save this node’s own next pointer
             let own_next = cmd.next.clone();
             // Decide what “splice target” to use:
             //   - if this node has its own_next, use that
             //   - otherwise, fall back to parent_next
-            let splice_target = own_next.clone().or(parent_next.clone());
+            let splice_target = own_next.clone().or_else(|| parent_next.clone());
 
-            // If it has a sub-block, recurse and then patch its tail
+            // If it has a sub-block, record its tail's splice and queue its body to have
+            // its own nested blocks' splices recorded.
             if let CommandData::BranchTarget(Some(ref sub_head)) = cmd.data
                 && cmd.code == '{'
             {
-                // 1) recurse into the sub-chain, passing splice_target
-                patch_block_endings_to_parent(Some(sub_head.clone()), splice_target.clone());
-
-                // 2) find the tail of that sub-chain
+                // find the tail of that sub-chain
                 let mut tail = sub_head.clone();
                 loop {
                     let next_in_sub = tail.borrow().next.clone();
@@ -138,8 +146,8 @@ fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
                     }
                 }
 
-                // 3) splice the tail’s `.next` to splice_target
-                tail.borrow_mut().next.clone_from(&splice_target);
+                writes.push((tail, splice_target.clone()));
+                pending.push((Some(sub_head.clone()), splice_target));
             }
 
             // drop the borrow before moving on
@@ -150,121 +158,162 @@ fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
         }
     }
 
-    // top-level has no parent, so pass None
-    patch_block_endings_to_parent(head, None);
+    for (tail, target) in writes {
+        tail.borrow_mut().next = target;
+    }
 }
 
-/// Populate the context's label map with references to associated commands.
+/// Populate the context's label map with references to associated commands. Descends
+/// into `{`-nested chains with an explicit worklist rather than recursing (deep nesting
+/// would otherwise overflow the native stack under WASI), pushing each nested chain to
+/// visit later instead of visiting it immediately.
 fn populate_label_map(
-    mut cur: Option<Rc<RefCell<Command>>>,
+    head: Option<Rc<RefCell<Command>>>,
     context: &mut ProcessingContext,
 ) -> UResult<()> {
-    while let Some(rc_cmd) = cur.take() {
-        // Borrow mutably just long enough to inspect/rewire this node
-        let cmd = rc_cmd.borrow_mut();
+    let mut pending = vec![head];
+    while let Some(mut cur) = pending.pop() {
+        while let Some(rc_cmd) = cur.take() {
+            // Borrow mutably just long enough to inspect/rewire this node
+            let cmd = rc_cmd.borrow_mut();
 
-        // Extract any label to insert after borrow ends
-        let maybe_label = match &cmd.data {
-            CommandData::BranchTarget(Some(sub_head)) => {
-                populate_label_map(Some(sub_head.clone()), context)?;
-                None
-            }
-            CommandData::Label(Some(label)) => Some(label.clone()),
-            _ => None,
-        };
+            // Extract any label to insert after borrow ends
+            let maybe_label = match &cmd.data {
+                CommandData::BranchTarget(Some(sub_head)) => {
+                    pending.push(Some(sub_head.clone()));
+                    None
+                }
+                CommandData::Label(Some(label)) => Some(label.clone()),
+                _ => None,
+            };
 
-        if let Some(label) = maybe_label
-            && cmd.code == ':'
-        {
-            if context.label_to_command_map.contains_key(&label) {
-                return semantic_error(&cmd.location, format!("duplicate label `{label}'"));
+            if let Some(label) = maybe_label
+                && cmd.code == ':'
+            {
+                if context.label_to_command_map.contains_key(&label) {
+                    return semantic_error(&cmd.location, format!("duplicate label `{label}'"));
+                }
+                context.label_to_command_map.insert(label, rc_cmd.clone());
             }
-            context.label_to_command_map.insert(label, rc_cmd.clone());
+
+            cur.clone_from(&cmd.next);
         }
-
-        cur.clone_from(&cmd.next);
     }
     Ok(())
 }
 
-/// Populate the context's address range command list with references to associated commands.
-fn populate_range_commands(mut cur: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
-    while let Some(rc_cmd) = cur.take() {
-        // Borrow mutably just long enough to inspect/rewire this node
-        let cmd = rc_cmd.borrow_mut();
+/// Populate the context's address range command list with references to associated
+/// commands. See [`populate_label_map`] for why `{`-nested chains go on a worklist
+/// instead of a recursive call.
+fn populate_range_commands(head: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
+    let mut pending = vec![head];
+    while let Some(mut cur) = pending.pop() {
+        while let Some(rc_cmd) = cur.take() {
+            // Borrow mutably just long enough to inspect/rewire this node
+            let cmd = rc_cmd.borrow_mut();
 
-        // Recursively process blocks.
-        if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
-            populate_range_commands(Some(Rc::clone(sub_head)), context);
+            if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
+                pending.push(Some(Rc::clone(sub_head)));
+            }
+
+            if cmd.addr2.is_some() {
+                // Save detected range command.
+                context.range_commands.push(Rc::clone(&rc_cmd));
+            }
+
+            cur.clone_from(&cmd.next);
         }
-
-        if cmd.addr2.is_some() {
-            // Save detected range command.
-            context.range_commands.push(Rc::clone(&rc_cmd));
-        }
-
-        cur.clone_from(&cmd.next);
     }
 }
 
 /// Replace branch labels with references to the corresponding commands.
-/// Raise an error on undefined labels.
+/// Raise an error on undefined labels. See [`populate_label_map`] for why `{`-nested
+/// chains go on a worklist instead of a recursive call.
 fn resolve_branch_targets(
-    mut cur: Option<Rc<RefCell<Command>>>,
+    head: Option<Rc<RefCell<Command>>>,
     context: &mut ProcessingContext,
 ) -> UResult<()> {
-    while let Some(rc_cmd) = cur.take() {
-        // Borrow mutably just long enough to inspect/rewire this node
-        let mut cmd = rc_cmd.borrow_mut();
+    let mut pending = vec![head];
+    while let Some(mut cur) = pending.pop() {
+        while let Some(rc_cmd) = cur.take() {
+            // Borrow mutably just long enough to inspect/rewire this node
+            let mut cmd = rc_cmd.borrow_mut();
 
-        // Recurse into blocks
-        if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
-            resolve_branch_targets(Some(sub_head.clone()), context)?;
+            if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
+                pending.push(Some(sub_head.clone()));
+            }
+
+            // Only for 't', 'T', or 'b' commands:
+            if matches!(cmd.code, 't' | 'T' | 'b') {
+                // Take ownership of the current data
+                let old_data = mem::replace(&mut cmd.data, CommandData::None);
+
+                // Build the replacement
+                let new_data = match old_data {
+                    CommandData::Label(Some(label)) => {
+                        let target = context
+                            .label_to_command_map
+                            .get(&label)
+                            .cloned()
+                            .ok_or_else(|| {
+                                semantic_error::<()>(
+                                    &cmd.location,
+                                    format!("undefined label `{label}'"),
+                                )
+                                .unwrap_err()
+                            })?;
+                        CommandData::BranchTarget(Some(target))
+                    }
+                    CommandData::Label(None) => CommandData::BranchTarget(None),
+                    other => other, // put back anything else unchanged
+                };
+
+                // Store it back
+                cmd.data = new_data;
+            }
+
+            // Advance to the next sibling
+            cur.clone_from(&cmd.next);
         }
-
-        // Only for 't', 'T', or 'b' commands:
-        if matches!(cmd.code, 't' | 'T' | 'b') {
-            // Take ownership of the current data
-            let old_data = mem::replace(&mut cmd.data, CommandData::None);
-
-            // Build the replacement
-            let new_data = match old_data {
-                CommandData::Label(Some(label)) => {
-                    let target = context
-                        .label_to_command_map
-                        .get(&label)
-                        .cloned()
-                        .ok_or_else(|| {
-                            semantic_error::<()>(
-                                &cmd.location,
-                                format!("undefined label `{label}'"),
-                            )
-                            .unwrap_err()
-                        })?;
-                    CommandData::BranchTarget(Some(target))
-                }
-                CommandData::Label(None) => CommandData::BranchTarget(None),
-                other => other, // put back anything else unchanged
-            };
-
-            // Store it back
-            cmd.data = new_data;
-        }
-
-        // Advance to the next sibling
-        cur.clone_from(&cmd.next);
     }
     Ok(())
 }
 
 /// Compile provided scripts into a sequence of commands.
+/// One `{ ... }` nesting level's partial command list, plus (for every level but the
+/// outermost) the `{` command whose `BranchTarget` gets this level's head once it closes.
+struct CompileFrame {
+    head: Option<Rc<RefCell<Command>>>,
+    tail: Option<Rc<RefCell<Command>>>,
+    opener: Option<Rc<RefCell<Command>>>,
+}
+
+impl CompileFrame {
+    fn link(&mut self, cmd: Rc<RefCell<Command>>) {
+        if let Some(ref t) = self.tail {
+            t.borrow_mut().next = Some(cmd.clone());
+        } else {
+            self.head = Some(cmd.clone());
+        }
+        self.tail = Some(cmd);
+    }
+}
+
+/// Compile a `{ ... }`-nested sequence of commands. `{` and `}` push and pop a frame on
+/// `stack` instead of recursing natively: GNU sed's own compiler doesn't recurse for
+/// nesting either, and a few thousand levels (well within what one `sed -f` script might
+/// contain) would overflow a native call stack under WASI, where a Golem agent has no
+/// way to recover from that trap.
 fn compile_sequence(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
     context: &mut ProcessingContext,
 ) -> UResult<Option<Rc<RefCell<Command>>>> {
-    let mut head: Option<Rc<RefCell<Command>>> = None;
-    let mut tail: Option<Rc<RefCell<Command>>> = None;
+    let mut stack = vec![CompileFrame {
+        head: None,
+        tail: None,
+        opener: None,
+    }];
 
     loop {
         line.eat_spaces();
@@ -291,7 +340,17 @@ fn compile_sequence(
         if line.eol() || line.current() == '#' {
             match lines.next_line()? {
                 None => {
-                    return Ok(head);
+                    // EOF: collapse every open frame (as recursive returns would have,
+                    // one level at a time), so an unmatched `{` still just gives back a
+                    // partial tree — `compile()`'s `parsed_block_nesting` check is what
+                    // turns that into "unmatched `{'".
+                    while stack.len() > 1 {
+                        let finished = stack.pop().unwrap();
+                        if let Some(opener) = &finished.opener {
+                            opener.borrow_mut().data = CommandData::BranchTarget(finished.head);
+                        }
+                    }
+                    return Ok(stack.pop().unwrap().head);
                 }
                 Some(line_bytes) => {
                     *line = ScriptCharProvider::new(line_bytes);
@@ -316,19 +375,34 @@ fn compile_sequence(
                 cmd_mut.code = line.current();
                 (cmd_spec.handler)(lines, line, &mut cmd_mut, context)?;
             }
-            CommandHandling::Return => return Ok(head),
+            CommandHandling::Return => {
+                // `}`: close the innermost frame and resume filling its parent. The `}`
+                // command itself is never linked into any list (it carries no data).
+                drop(cmd_mut);
+                let finished = stack.pop().ok_or_else(|| {
+                    compilation_error::<()>(lines, line, "unexpected `}'").unwrap_err()
+                })?;
+                if let Some(opener) = &finished.opener {
+                    opener.borrow_mut().data = CommandData::BranchTarget(finished.head);
+                }
+                continue;
+            }
             CommandHandling::Continue => (),
         }
+        let opens_block = cmd_mut.code == '{';
         drop(cmd_mut);
 
-        if let Some(ref t) = tail {
-            // there's already a tail: link it
-            t.borrow_mut().next = Some(cmd.clone());
-        } else {
-            // first element: set head
-            head = Some(cmd.clone());
+        stack.last_mut().unwrap().link(cmd.clone());
+        if opens_block {
+            // `{`: everything up to the matching `}` belongs to a new, inner frame;
+            // `cmd`'s `BranchTarget` is filled in (replacing the `None` placeholder
+            // `compile_block_command` left) when that frame closes above.
+            stack.push(CompileFrame {
+                head: None,
+                tail: None,
+                opener: Some(cmd),
+            });
         }
-        tail = Some(cmd);
     }
 }
 
@@ -1203,6 +1277,12 @@ fn compile_read_line_command(
 }
 
 // Handles {
+// `compile_sequence` special-cases `{` itself (it must push a new frame onto its own
+// frame stack rather than recurse), so this handler only does the two things that must
+// happen exactly where `{` is consumed: skip past it and count the nesting for
+// `compile_end_group_command`'s "unexpected `}'" check. `cmd.data` is filled in once the
+// matching `}` (or EOF) closes the frame; `compile_sequence` leaves it as `BranchTarget
+// (None)` (an empty block) until then.
 fn compile_block_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
@@ -1214,8 +1294,7 @@ fn compile_block_command(
     if context.parsed_block_nesting > MAX_BLOCK_NESTING {
         return compilation_error(lines, line, ERR_BLOCK_NESTING_TOO_DEEP);
     }
-    let block_body = compile_sequence(lines, line, context)?;
-    cmd.data = CommandData::BranchTarget(block_body);
+    cmd.data = CommandData::BranchTarget(None);
     Ok(CommandHandling::Continue)
 }
 

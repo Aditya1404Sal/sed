@@ -1097,7 +1097,11 @@ pub fn process_all_files(
         let mut reader = match LineReader::open(&path) {
             Ok(reader) => reader,
             Err(error) => {
-                eprintln!("sed: can't read {}: {error}", path.display());
+                // Under wasm32-wasip2, `io::Error`'s own `Display` appends a
+                // "(os error N)" suffix GNU's own message never has.
+                let text = error.to_string();
+                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                eprintln!("sed: can't read {}: {text}", path.display());
                 set_exit_code(2);
                 continue;
             }

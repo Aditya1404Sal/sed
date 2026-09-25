@@ -1145,7 +1145,10 @@ fn trans_utf8_character_in_c_utf8_locale() {
         .stdout_is_bytes(b"Ka\n");
 }
 
-/// Transliterate a decoded hex escape as UTF-8 in UTF-8 mode.
+/// GNU's `\xHH` (and `\dNNN`/`\oNNN`) is always a byte escape, even in UTF-8 mode: it never
+/// matches a real multi-byte UTF-8 character sharing the same numeric codepoint. `\xE9` (raw
+/// byte 0xE9) leaves a genuine 'é' (U+00E9, encoded as the two bytes 0xC3 0xA9) untouched,
+/// since neither of its bytes is 0xE9 (verified against real GNU sed; see FB-033).
 #[test]
 fn trans_utf8_escape_in_c_utf8_locale() {
     new_ucmd!()
@@ -1153,7 +1156,50 @@ fn trans_utf8_escape_in_c_utf8_locale() {
         .args(&["-e", r"y/\xE9/Z/"])
         .pipe_in("é\n")
         .succeeds()
+        .stdout_is_bytes("é\n".as_bytes());
+}
+
+/// The same byte escape does match a genuine raw 0xE9 byte in the input, in UTF-8 mode, just
+/// as it does in the C locale (see `trans_byte_escape_matches_invalid_input_in_c_locale`).
+#[test]
+fn trans_byte_escape_matches_raw_byte_in_c_utf8_locale() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"y/\xE9/Z/"])
+        .pipe_in(b"\xE9\n".to_vec())
+        .succeeds()
         .stdout_is_bytes(b"Z\n");
+}
+
+/// The same byte escape also matches in `s///`, both in the pattern and (producing the raw
+/// byte back) in the replacement — this is the primary FB-033 case: `\xff` in a script and a
+/// raw byte in the data should match and produce the byte, as GNU does, regardless of locale.
+#[test]
+fn subst_byte_escape_matches_and_produces_raw_byte_in_c_utf8_locale() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/\xff/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/x/\xff/"])
+        .pipe_in(b"x\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"\xff\n");
+}
+
+/// The same byte escape matches and produces the raw byte in ERE mode (`-E`) too, exercising
+/// the other half of `push_pattern_escaped_char`'s `RegexMode`-aware emission.
+#[test]
+fn subst_byte_escape_matches_raw_byte_in_ere_mode() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-E", "-e", r"s/\xff/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
 }
 
 /// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.

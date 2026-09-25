@@ -15,7 +15,7 @@ use crate::sed::command::{
 };
 use crate::sed::delimited_parser::{
     os_string_from_bytes, parse_char_escape, parse_regex_for_mode, parse_transliteration_for_mode,
-    push_script_char,
+    push_escaped_char,
 };
 use crate::sed::error_handling::{ScriptLocation, compilation_error, semantic_error};
 use crate::sed::fast_regex::Regex;
@@ -878,7 +878,7 @@ pub fn compile_replacement(
                         // other escape sequences
                         _ => {
                             if let Some(decoded) = parse_char_escape(line) {
-                                push_script_char(&mut literal, decoded, character_mode);
+                                push_escaped_char(&mut literal, decoded, character_mode);
                             } else {
                                 literal.push(b'\\');
                                 literal.push(line.current_byte());
@@ -1457,7 +1457,7 @@ fn compile_text_command_gnu(
             }
 
             if let Some(decoded) = parse_char_escape(line) {
-                push_script_char(&mut text, decoded, context.character_mode);
+                push_escaped_char(&mut text, decoded, context.character_mode);
             } else {
                 // Invalid escapes result in the escaped character.
                 text.push(line.current_byte());
@@ -1670,7 +1670,7 @@ fn compile_execute_command(
             }
 
             if let Some(decoded) = parse_char_escape(line) {
-                push_script_char(&mut text, decoded, context.character_mode);
+                push_escaped_char(&mut text, decoded, context.character_mode);
             } else {
                 // Invalid escapes result in the escaped character.
                 text.push(line.current_byte());
@@ -2629,14 +2629,13 @@ mod tests {
 
     #[test]
     fn test_compile_replacement_escape_utf8_mode() {
+        // GNU inserts the literal byte a `\xHH` escape produces, never a UTF-8 encoding of it,
+        // regardless of character mode: same expectation as `..._byte_mode` above.
         let (mut lines, mut chars) = make_providers("/\\xE9/");
         let template = compile_replacement(&mut lines, &mut chars, CharacterMode::Utf8).unwrap();
 
         assert_eq!(template.parts.len(), 1);
-        assert!(matches!(
-            &template.parts[0],
-            ReplacementPart::Literal(s) if s == "é".as_bytes()
-        ));
+        assert!(matches!(&template.parts[0], ReplacementPart::Literal(s) if s == b"\xE9"));
     }
 
     #[test]

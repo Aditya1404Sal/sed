@@ -236,6 +236,18 @@ pub fn ensure_dotall(pattern: &str) -> String {
     // Add s flag to ?(...) unless 's' or its complement 'm' is there.
     let flags = &pattern[2..close];
 
+    // A scoped group like `(?-u:...)` (a byte-literal escape — see
+    // `push_pattern_escaped_char` — or a lookaround assertion built for `\<`/`\>`) sets its
+    // flags for its own body only, not for the pattern from that point on, so it is not the
+    // inline-flag-prefix case this function means to extend here. Treated as one anyway, the
+    // `:` before its body reads as part of "flags" and `close` lands on the body's own `)`,
+    // splicing `s` into the body instead of prepending a group — e.g. turning `(?-u:\xFF)`
+    // into the corrupted `(?-u:\xFFs)`. Fall back to wrapping the whole pattern instead, same
+    // as if it hadn't opened with `(?` at all.
+    if flags.contains(':') {
+        return format!("(?s){pattern}");
+    }
+
     if flags.contains('m') || flags.contains('s') {
         pattern.to_owned()
     } else {

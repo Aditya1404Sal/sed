@@ -261,8 +261,15 @@ fn get_scripts_files(matches: &ArgMatches) -> UResult<(Vec<ScriptValue>, Vec<Pat
         files.extend(rest_files);
     }
 
-    // Read from stdin if no file has been specified.
+    // Read from stdin if no file has been specified — except under -i/--in-place, where
+    // there's no real file to write the edit back to, so GNU refuses outright instead of
+    // quietly trying (and failing) to in-place-edit "-" — verified against the oracle
+    // (`sed -i 's/a/b/'`, `sed -i p`, `sed -i.bak 's/a/b/'`, `sed --follow-symlinks -i
+    // 's/a/b/'` all give "no input files" at status 4, not a file-open error naming "-").
     if files.is_empty() {
+        if matches.contains_id("in-place") {
+            return Err(USimpleError::new(4, "no input files"));
+        }
         files.push(PathBuf::from("-"));
     }
 

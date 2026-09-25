@@ -1202,6 +1202,38 @@ fn subst_byte_escape_matches_raw_byte_in_ere_mode() {
         .stdout_is_bytes(b"X\n");
 }
 
+/// A `\xHH` byte escape above ASCII inside a bracket expression, in UTF-8 mode, matches
+/// nothing at all — verified against the real GNU oracle: `[\xff]` matches neither the raw
+/// byte 0xFF nor the Unicode character U+00FF ('ÿ'). Negated, `[^\xff]` matches any (valid)
+/// character instead, since the empty positive class negates to "everything".
+#[test]
+fn subst_byte_escape_in_bracket_never_matches_in_utf8_mode() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/[\xff]/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"\xff\n");
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/[^\xff]/X/"])
+        .pipe_in(b"a\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
+/// The same escape still matches a raw byte inside a bracket expression in the `C` (byte)
+/// locale, unaffected by the UTF-8-mode-only behavior above.
+#[test]
+fn subst_byte_escape_in_bracket_matches_raw_byte_in_c_locale() {
+    new_ucmd!()
+        .env("LC_ALL", "C")
+        .args(&["-e", r"s/[\xff]/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
 /// A raw (non-UTF-8) byte *in the script argument itself* — not a `\xHH` escape, but the
 /// literal byte, as arrives from a shell doing `x=$'\xff'; sed "s/$x/X/"` — also matches the
 /// same raw byte in the data. This needs `script`/`expression` to be `OsString`-valued clap

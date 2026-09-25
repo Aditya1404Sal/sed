@@ -212,6 +212,27 @@ pub fn push_transliteration_escaped_char(
     }
 }
 
+/// Append an escaped character for a bracket expression's own content (inside the `[...]`,
+/// not the surrounding pattern). Verified against the real oracle: unlike everywhere else, a
+/// `\dNNN`/`\oNNN`/`\xHH` byte escape above ASCII contributes *nothing at all* to a bracket
+/// expression under `CharacterMode::Utf8` — `[a\xffb-d]` matches exactly what `[ab-d]` does,
+/// neither the raw byte 0xFF nor the Unicode character U+00FF (checked both ways: a literal
+/// 0xFF byte and a literal 'ÿ' character in the input, under `LC_ALL=C.UTF-8`, both left
+/// unmatched by `s/[\xff]/X/`). So this drops it silently, matching that real (if surprising)
+/// GNU behavior, rather than the pattern/replacement/`y///` contexts' `EscapedChar::Byte`
+/// handling — none of which apply here, since GNU itself does not make this byte matchable.
+fn push_class_escaped_char(
+    bytes: &mut Vec<u8>,
+    escaped: EscapedChar,
+    character_mode: CharacterMode,
+) {
+    match escaped {
+        EscapedChar::Byte(b) if character_mode == CharacterMode::Utf8 && b > 0x7F => {}
+        EscapedChar::Byte(b) => bytes.push(b),
+        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
+    }
+}
+
 /// Decode parsed script bytes as UTF-8 for character-mode parsing.
 fn parsed_bytes_to_utf8(
     lines: &ScriptLineProvider,
@@ -350,10 +371,18 @@ fn parse_character_class(
     result.push(b'[');
 
     // Optional negation
-    if !line.eol() && line.current() == '^' {
+    let negated = !line.eol() && line.current() == '^';
+    if negated {
         result.push(b'^');
         line.advance();
     }
+
+    // Where this class's own members start, past its `[`/`^`: if nothing is added past this
+    // point (every member turned out to be a dropped byte escape — see
+    // `push_class_escaped_char` — and there was no leading `]` literal either), the class is
+    // empty, which needs its own handling below. A leading `]` (checked next) is itself a real
+    // member, so this is captured before that check, not after it.
+    let members_start = result.len();
 
     // Optional leading ']' inside the class
     if !line.eol() && line.current() == ']' {
@@ -365,6 +394,24 @@ fn parse_character_class(
         let ch = line.current();
 
         if ch == ']' {
+            if result.len() == members_start {
+                // Every member this class would have had was a byte escape above ASCII in
+                // `CharacterMode::Utf8`, silently dropped (see `push_class_escaped_char`) —
+                // verified against the oracle, `[\xff]` matches nothing at all under a UTF-8
+                // locale, and `[^\xff]` matches any (valid) character. Neither is expressible
+                // as a bracket expression with zero members (the `regex`/`fancy_regex` crates
+                // reject `[]`/`[^]` outright, unlike glibc's own regex), so substitute the
+                // equivalent construct directly: `\b\B` can never be true at the same position
+                // (a never-match, whatever surrounds it — safe under `bre_to_ere` too, since
+                // neither character is one of its escape-sensitive ones), and `.` matches any
+                // character now that `fast_regex::ensure_dotall` makes it include newline too.
+                line.advance();
+                return Ok(if negated {
+                    b".".to_vec()
+                } else {
+                    br"\b\B".to_vec()
+                });
+            }
             result.push(b']');
             line.advance();
             return Ok(result);
@@ -431,19 +478,7 @@ fn parse_character_class(
                 break;
             }
             if let Some(decoded) = parse_char_escape(line) {
-                // A byte escape here can't use `push_pattern_escaped_char`'s `(?-u:\xHH)`
-                // group: POSIX bracket expressions have no group syntax, so `(`/`)` there are
-                // just two more literal members, not the start of a raw-byte assertion, and
-                // pushing the raw byte directly would break `CharacterMode::Utf8`'s later
-                // UTF-8 check instead of matching it. A character class with a
-                // `\dNNN`/`\oNNN`/`\xHH` member above ASCII is thus a known gap this fix
-                // doesn't close — see FB-033 in the progress notes — so this keeps the
-                // pre-fix (character-only) encoding for that one context.
-                let ch = match decoded {
-                    EscapedChar::Byte(b) => char::from(b),
-                    EscapedChar::Char(ch) => ch,
-                };
-                push_script_char(&mut result, ch, character_mode);
+                push_class_escaped_char(&mut result, decoded, character_mode);
             } else {
                 result.push(b'\\');
                 result.push(line.current_byte());
@@ -1244,6 +1279,53 @@ mod tests {
         let lines = test_lines();
         let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
         assert_eq!(result, b"[^]abc]");
+    }
+
+    // A `\dNNN`/`\oNNN`/`\xHH` byte escape above ASCII, in `CharacterMode::Utf8`, contributes
+    // nothing to a bracket expression's members — verified against the oracle: `[\xff]`
+    // matches neither the raw byte 0xFF nor the Unicode character U+00FF ('ÿ') under a real
+    // `LC_ALL=C.UTF-8`. `push_class_escaped_char`/`parse_character_class`'s empty-class handling
+    // covers the cases below; `CharacterMode::Byte` is unaffected (`byte_regex_pattern`
+    // downstream already handles it, same as outside a class).
+
+    #[test]
+    fn test_byte_escape_dropped_among_other_members() {
+        let mut line = char_provider_from("[a\\xffb-d]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, b"[ab-d]");
+    }
+
+    #[test]
+    fn test_byte_escape_only_becomes_never_matches() {
+        let mut line = char_provider_from("[\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, br"\b\B");
+    }
+
+    #[test]
+    fn test_negated_byte_escape_only_becomes_matches_anything() {
+        let mut line = char_provider_from("[^\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, b".");
+    }
+
+    #[test]
+    fn test_byte_escape_after_leading_close_bracket_keeps_the_literal() {
+        let mut line = char_provider_from("[]\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, b"[]]");
+    }
+
+    #[test]
+    fn test_byte_escape_in_byte_mode_is_unaffected() {
+        let mut line = char_provider_from("[\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Byte).unwrap();
+        assert_eq!(result, b"[\xff]");
     }
 
     #[test]

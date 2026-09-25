@@ -1424,7 +1424,8 @@ fn compile_version_command(
 
     let mut ver_semantic = 0;
 
-    while !line.eol() {
+    // Like a label, the version ends at whitespace or `;`, so `v 4.2;p` runs `p`.
+    while !line.eol() && !line.current().is_whitespace() && line.current() != ';' {
         if line.current() == '.' {
             ver_semantic += 1;
             line.advance();
@@ -1456,7 +1457,8 @@ fn compile_version_command(
         Ok(major_int) => match minor.parse::<u8>() {
             Ok(minor_int) => match patch.parse::<u8>() {
                 Ok(patch_int) => {
-                    if minor_int <= GNU_MINOR && major_int <= GNU_MAJOR && patch_int == GNU_PATCH {
+                    // Version order, as GNU's strverscmp gives: 3.99 is older than 4.9.
+                    if (major_int, minor_int, patch_int) <= (GNU_MAJOR, GNU_MINOR, GNU_PATCH) {
                         return Ok(CommandHandling::Continue);
                     }
                     compilation_error(lines, line, "expected newer version of sed")

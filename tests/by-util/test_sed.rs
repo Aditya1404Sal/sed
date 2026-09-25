@@ -26,6 +26,31 @@ fn test_invalid_arg() {
 }
 
 #[test]
+fn test_version_command_is_a_no_op() {
+    new_ucmd!()
+        .arg("v")
+        .pipe_in("a\n")
+        .succeeds()
+        .stdout_is("a\n");
+    // The version ends at `;` or a space, and compares as GNU's strverscmp does.
+    for script in ["v 4.2;p", "v 3.99;p", "v 4.9 ; p"] {
+        new_ucmd!()
+            .args(&["-n", script])
+            .pipe_in("a\n")
+            .succeeds()
+            .stdout_is("a\n");
+    }
+    for script in ["v 4.10", "v 5;p"] {
+        new_ucmd!()
+            .arg(script)
+            .pipe_in("a\n")
+            .fails()
+            .code_is(1)
+            .stderr_contains("expected newer version of sed");
+    }
+}
+
+#[test]
 fn test_version() {
     let short = new_ucmd!()
         .arg("-V")

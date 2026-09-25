@@ -1010,6 +1010,9 @@ pub fn process_line(
                 ':' => {
                     // Branch target; do nothing.
                 }
+                'v' => {
+                    // GNU's version requirement; checked when compiled, a no-op when run.
+                }
                 '=' => {
                     // Output current line number.
                     output.write_str(format!("{}\n", context.line_number))?;

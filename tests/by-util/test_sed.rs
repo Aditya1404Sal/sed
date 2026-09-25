@@ -2501,11 +2501,16 @@ fn test_empty_text_commands_fail() {
 
 #[test]
 fn test_addr0_non_posix() {
+    // GNU's own wording and location for every misuse of line address 0 is the same generic
+    // "invalid usage of line address 0", including under --posix (which disables the whole
+    // `0,/regexp/` extension, so even an otherwise-valid second regex address still fails) — and
+    // GNU only reports it once the *whole* address construct has been parsed (char 8, right
+    // after `0,/foo/`), not the instant it sees the `0` (char 2) — verified against the oracle.
     new_ucmd!()
         .args(&["--posix", "0,/foo/p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 2: address 0 is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 8: invalid usage of line address 0\n");
 }
 
 #[test]
@@ -2514,7 +2519,7 @@ fn test_addr0_second_required() {
         .args(&["0p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 2: address 0 can only be used with ~step, a second regular expression, or a read command\n");
+        .stderr_is("sed: -e expression #1, char 2: invalid usage of line address 0\n");
 }
 
 #[test]
@@ -2523,7 +2528,7 @@ fn test_addr0_second_re_only() {
         .args(&["0,4p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: -e expression #1, char 4: address 0 can only be used with ~step, a second regular expression, or a read command\n");
+        .stderr_is("sed: -e expression #1, char 4: invalid usage of line address 0\n");
 }
 
 #[test]

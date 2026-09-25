@@ -33,8 +33,11 @@ use std::rc::Rc;
 
 use uucore::error::{UResult, USimpleError};
 
-const ERR_ADDRESS_0_USAGE: &str =
-    "address 0 can only be used with ~step, a second regular expression, or a read command";
+// GNU's own wording, verified against the oracle for a bare `0p`, `0,5p`, and `--posix
+// 0,/foo/p` (posix disables the whole address-0 extension, so every use of it fails, not just
+// the ones the non-posix message describes) — all three report this exact text, not a
+// description of what *would* have been valid.
+const ERR_ADDRESS_0_USAGE: &str = "invalid usage of line address 0";
 const ERR_SANDBOX: &str = "e/r/w commands disabled in sandbox mode";
 const ERR_NO_EXEC: &str =
     "the 'e' command and substitute flag are unsupported here: no shell to run";
@@ -446,10 +449,12 @@ fn compile_address_range(
         let addr1 = compile_address(lines, line, context)?;
         is_line0 = matches!(addr1, Address::Line(0));
         cmd.addr1 = Some(addr1);
-        if is_line0 && context.posix {
-            // 0 starting address is a GNU extension.
-            return compilation_error(lines, line, "address 0 is invalid in POSIX mode");
-        }
+        // A 0 starting address (valid only as `0,/regexp/`, a GNU extension letting the regexp
+        // match on line 1 too) is checked once the whole address construct has been parsed, not
+        // here — GNU doesn't fail the instant it sees the `0`, it waits to see what follows
+        // (`compile_address_range`'s two `ERR_ADDRESS_0_USAGE` sites below), --posix included:
+        // verified against the oracle, `sed --posix '0,/foo/p'` fails at char 8 (right after the
+        // full `0,/foo/`), not char 2 (right after the `0`).
         n_addr += 1;
     }
 
@@ -502,7 +507,7 @@ fn compile_address_range(
                 0 // dummy, not used
             };
 
-            if is_line0 && !matches!(addr2, Address::Re(_)) && !is_step_match {
+            if is_line0 && (context.posix || (!matches!(addr2, Address::Re(_)) && !is_step_match)) {
                 return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
             }
 
@@ -523,7 +528,7 @@ fn compile_address_range(
         // After retrieval of first address, subsequent spaces
         // are consumed unconditionally. By now, the position
         // must be in non-whitespace character or EOL.
-        if line.eol() || line.current() != 'r' {
+        if context.posix || line.eol() || line.current() != 'r' {
             return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
         }
     }

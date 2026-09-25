@@ -1278,11 +1278,13 @@ fn compile_negation_command(
     cmd: &mut Command,
     _context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
-    line.advance();
-    line.eat_spaces();
+    // GNU reports a second `!` at its own position (char 5 in `1,2!!p`), not after skipping
+    // past it (char 6, where this used to check) — verified against the oracle.
     if cmd.non_select {
         return compilation_error(lines, line, "multiple `!'s");
     }
+    line.advance();
+    line.eat_spaces();
     cmd.non_select = true;
     Ok(CommandHandling::GetNext)
 }

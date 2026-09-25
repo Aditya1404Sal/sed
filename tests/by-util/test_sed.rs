@@ -1975,6 +1975,33 @@ fn in_place_edit_replace() -> std::io::Result<()> {
     Ok(())
 }
 
+// FB-020: `-i` over several files must treat each one as its own address stream (as if
+// `-s` were also given), not one continuous stream across all of them — otherwise `1i`
+// only reaches the first file and `$a` only the last.
+#[test]
+fn in_place_edit_addresses_each_file_separately() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, "a1\na2\n")?;
+    std::fs::write(&b, "b1\nb2\n")?;
+
+    new_ucmd!()
+        .args(&["-i", "1i# header", a.to_str().unwrap(), b.to_str().unwrap()])
+        .succeeds();
+    assert_eq!(std::fs::read_to_string(&a)?, "# header\na1\na2\n");
+    assert_eq!(std::fs::read_to_string(&b)?, "# header\nb1\nb2\n");
+
+    std::fs::write(&a, "a1\na2\n")?;
+    std::fs::write(&b, "b1\nb2\n")?;
+    new_ucmd!()
+        .args(&["-i", "$a# footer", a.to_str().unwrap(), b.to_str().unwrap()])
+        .succeeds();
+    assert_eq!(std::fs::read_to_string(&a)?, "a1\na2\n# footer\n");
+    assert_eq!(std::fs::read_to_string(&b)?, "b1\nb2\n# footer\n");
+    Ok(())
+}
+
 #[test]
 fn in_place_edit_backup() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;

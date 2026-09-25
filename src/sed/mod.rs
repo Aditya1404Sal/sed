@@ -308,7 +308,10 @@ fn build_context(matches: &ArgMatches) -> UResult<ProcessingContext> {
         length: matches.get_one::<u32>("length").map_or(70, |v| *v as usize),
         quiet: matches.get_flag("quiet"),
         posix: matches.get_flag("posix"),
-        separate: matches.get_flag("separate"),
+        // `-i` edits each file into its own separate output, so GNU treats each one as
+        // its own address stream even without an explicit `-s`: line numbers restart and
+        // `$` matches each file's own last line, not just the last file's.
+        separate: matches.get_flag("separate") || matches.contains_id("in-place"),
         sandbox: matches.get_flag("sandbox"),
         no_exec: !cfg!(any(unix, windows)),
         unbuffered: matches.get_flag("unbuffered"),

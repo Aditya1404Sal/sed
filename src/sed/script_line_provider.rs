@@ -13,8 +13,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
-use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult};
+use uucore::error::{UResult, USimpleError};
 
 #[derive(Debug, PartialEq)]
 /// The specification of a script: through a string or a file
@@ -161,8 +160,18 @@ impl ScriptLineProvider {
                         line_number: 0,
                     };
                 } else {
-                    let file = File::open(p)
-                        .map_err_context(|| format!("error opening script file {}", p.quote()))?;
+                    // GNU's own wording and exit status, verified against the oracle
+                    // (`sed -f nosuchfile` -> "couldn't open file nosuchfile: No such file or
+                    // directory", status 4, with no `-e expression #N` location prefix at all —
+                    // this isn't a script *syntax* error, it's a plain file-open failure).
+                    // `io::Error`'s own `Display` appends a "(os error N)" suffix under
+                    // wasm32-wasip2 that GNU's own message never has, so it's stripped here the
+                    // same way the `-i`/`-s` file-open path already does (FA-082).
+                    let file = File::open(p).map_err(|error| {
+                        let text = error.to_string();
+                        let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                        USimpleError::new(4, format!("couldn't open file {}: {text}", p.display()))
+                    })?;
                     self.state = State::Active {
                         index: next_index,
                         reader: Box::new(BufReader::new(file)),

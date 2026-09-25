@@ -70,11 +70,16 @@ impl Engine {
         // this call entirely — `--help`/`--version` text (and any usage error) leaks out
         // unredirected and unpiped, and the message `Display` actually returns is empty.
         // `clap::Error`'s own `Display` has no such side effect, so build the message from
-        // that instead, before the wrapper ever gets a chance to.
+        // that instead, before the wrapper ever gets a chance to. The status code mirrors
+        // `ClapErrorWrapper::code`'s own convention exactly (0 for `--help`/`--version`,
+        // since GNU exits 0 for both; 1 for every other clap usage error) rather than
+        // `clap::Error::exit_code()`, which is 2 for a plain usage error — GNU's sed uses 1.
         let matches = uu_app()
             .try_get_matches_from(normalize_in_place(args))
             .map_err(|error| {
-                uucore::error::USimpleError::new(error.exit_code(), error.to_string())
+                use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+                let code = i32::from(!matches!(error.kind(), DisplayHelp | DisplayVersion));
+                uucore::error::USimpleError::new(code, error.to_string())
             })?;
         let (scripts, files) = get_scripts_files(&matches)?;
         let mut context = build_context(&matches)?;

@@ -668,7 +668,8 @@ fn subst_backref_rejected_in_c_locale() {
         .env("LC_ALL", "C")
         .args(&["-e", r"s/\(.\)\1/X/"])
         .fails()
-        .stderr_contains("back-references are not supported in byte mode");
+        .stderr_contains("back-references")
+        .stderr_contains("not supported in byte mode");
 }
 
 /// Allow substitution back-references when the locale selects UTF-8 mode.
@@ -2543,4 +2544,48 @@ fn test_change_command_on_relative_range() {
         .pipe_in("alpha\nbeta\ngamma\ndelta\n")
         .succeeds()
         .stdout_is("alpha\nX\ndelta\n");
+}
+
+// FB-078/FA-077: a bare `l` wraps at the `-l` length (default 70), which is not tied
+// to any controlling terminal width (there is none under WASI).
+#[test]
+fn test_l_command_default_width_is_70() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-n", "l"])
+        .pipe_in(format!("{}\n", "a".repeat(80)))
+        .succeeds()
+        .stdout_is(format!("{}\\\n{}$\n", "a".repeat(69), "a".repeat(11)));
+}
+
+#[test]
+fn test_l_command_honors_dash_l() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-n", "-l", "10", "l"])
+        .pipe_in("abcdefghij\n")
+        .succeeds()
+        .stdout_is("abcdefghi\\\nj$\n");
+}
+
+// FA-077: `--posix` disables the GNU BRE/ERE extensions `\+`, `\?` and `\|`, so they
+// match as literal characters instead of one-or-more/zero-or-one/alternation.
+#[test]
+fn test_posix_disables_backslash_plus_extension() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["--posix", r"s/a\+/X/"])
+        .pipe_in("aaa+\n")
+        .succeeds()
+        .stdout_is("aaX\n");
+}
+
+#[test]
+fn test_non_posix_keeps_backslash_plus_extension() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&[r"s/a\+/X/"])
+        .pipe_in("aaa+\n")
+        .succeeds()
+        .stdout_is("X+\n");
 }

@@ -1183,6 +1183,18 @@ pub fn compile_subst_flags(
                 line.advance();
             }
 
+            // GNU's own wording, verified against the oracle: `s/a/b/0` -> "number option to
+            // `s' command may not be zero", not the generic "unknown option to `s'" a leading
+            // '0' fell into before (it can't be the start of a valid occurrence number the
+            // '1'..='9' arm below would ever see, since that arm only matches a nonzero digit).
+            '0' => {
+                return compilation_error(
+                    lines,
+                    line,
+                    "number option to `s' command may not be zero",
+                );
+            }
+
             _c @ '1'..='9' => {
                 if seen_n {
                     return compilation_error(lines, line, "multiple `g' options to `s' command");
@@ -1190,17 +1202,13 @@ pub fn compile_subst_flags(
 
                 let mut number = 0usize;
                 while !line.eol() && line.current().is_ascii_digit() {
+                    // GNU accepts an occurrence number past usize::MAX with no error at all —
+                    // verified against the oracle (`s/a/b/999999999999999999999`, 21 digits,
+                    // succeeds) — so this saturates instead of refusing, the same as GNU's own
+                    // unsigned-long overflow silently clamping.
                     number = number
-                        .checked_mul(10)
-                        .and_then(|n| n.checked_add(line.current().to_digit(10).unwrap() as usize))
-                        .ok_or_else(|| {
-                            compilation_error::<()>(
-                                lines,
-                                line,
-                                "overflow in numeric substitute flag",
-                            )
-                            .unwrap_err()
-                        })?;
+                        .saturating_mul(10)
+                        .saturating_add(line.current().to_digit(10).unwrap() as usize);
                     line.advance();
                 }
 
@@ -1748,7 +1756,9 @@ fn get_verified_cmd_spec(
     posix: bool,
 ) -> UResult<CommandSpec> {
     if line.eol() {
-        return compilation_error(lines, line, "command expected");
+        // GNU's own wording, verified against the oracle (`sed '1'`, `sed '1~'`, `sed '/re/I'`
+        // all reach this exact message, not this fork's earlier, unverified "command expected").
+        return compilation_error(lines, line, "missing command");
     }
 
     let ch = line.current();
@@ -2028,7 +2038,7 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("test.sed:1:0: error: command expected"));
+        assert!(msg.contains("test.sed:1:0: error: missing command"));
     }
 
     #[test]

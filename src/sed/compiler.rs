@@ -649,11 +649,7 @@ fn parse_number(
 }
 
 /// Parse the end of a command, failing with an error on extra characters.
-fn parse_command_ending(
-    lines: &ScriptLineProvider,
-    line: &mut ScriptCharProvider,
-    cmd: &mut Command,
-) -> UResult<()> {
+fn parse_command_ending(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> UResult<()> {
     if !line.eol() && line.current() == ';' {
         line.advance();
         return Ok(());
@@ -664,11 +660,10 @@ fn parse_command_ending(
     }
 
     if !line.eol() {
-        return compilation_error(
-            lines,
-            line,
-            format!("extra characters at the end of the {} command", cmd.code),
-        );
+        // GNU's own wording is command-agnostic — the same "extra characters after command"
+        // whichever command it was, not "...the end of the X command" — verified against the
+        // oracle for '=', 'p' and ':'.
+        return compilation_error(lines, line, "extra characters after command");
     }
 
     Ok(())
@@ -1036,7 +1031,7 @@ fn compile_subst_command(
     }
     cmd.data = CommandData::Substitution(subst);
 
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1078,7 +1073,7 @@ fn compile_trans_command(
     cmd.data = CommandData::Transliteration(transliteration);
 
     line.advance(); // move past last delimiter
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1210,7 +1205,7 @@ pub fn compile_subst_flags(
 fn compile_end_group_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
-    cmd: &mut Command,
+    _cmd: &mut Command,
     context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
     if context.parsed_block_nesting == 0 {
@@ -1219,7 +1214,7 @@ fn compile_end_group_command(
     context.parsed_block_nesting -= 1;
     line.advance();
     line.eat_spaces();
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Return)
 }
 
@@ -1244,13 +1239,13 @@ fn compile_negation_command(
 fn compile_empty_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
-    cmd: &mut Command,
+    _cmd: &mut Command,
     _context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
     line.advance(); // Skip the command character
     line.eat_spaces(); // Skip any trailing whitespace
 
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1365,7 +1360,7 @@ fn compile_label_command(
     }
 
     line.eat_spaces(); // Skip any trailing whitespace
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1399,7 +1394,7 @@ fn compile_number_command(
     }
 
     line.eat_spaces(); // Skip any trailing whitespace
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1725,6 +1720,14 @@ fn get_verified_cmd_spec(
     let cmd_spec = get_cmd_spec(lines, line, ch, posix)?;
 
     if n_addr > cmd_spec.n_addr {
+        // GNU's own wording for the one-address case is command-agnostic — "command only uses
+        // one address", not "command X expects up to N address(es), found M" — verified against
+        // the oracle for q, Q, and i/a/= under --posix (where their own n_addr also drops to 1).
+        // Commands with a different limit (0) haven't been checked against the oracle, so they
+        // keep the fork's own generic wording.
+        if cmd_spec.n_addr == 1 {
+            return compilation_error(lines, line, "command only uses one address");
+        }
         return compilation_error(
             lines,
             line,
@@ -1790,8 +1793,11 @@ fn get_cmd_spec(
             n_addr: 2,
             handler: compile_number_command,
         }),
+        // GNU restricts q to one address in every mode, not just --posix — verified against the
+        // oracle (`sed '1,2q'` fails the same way with or without --posix, unlike a/i/c/=, whose
+        // second address really is a GNU-only extension).
         'q' => Ok(CommandSpec {
-            n_addr: if posix { 1 } else { 2 },
+            n_addr: 1,
             handler: compile_number_command,
         }),
         // Q is a GNU extension
@@ -1911,16 +1917,9 @@ mod tests {
     #[test]
     fn test_parse_command_ending_rejects_extra_characters() {
         let (lines, mut chars) = make_providers("extra");
-        let mut cmd = Command {
-            code: 'p',
-            ..Default::default()
-        };
 
-        let err = parse_command_ending(&lines, &mut chars, &mut cmd).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("extra characters at the end of the p command")
-        );
+        let err = parse_command_ending(&lines, &mut chars).unwrap_err();
+        assert!(err.to_string().contains("extra characters after command"));
     }
 
     #[test]
@@ -2007,9 +2006,7 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("input.sed:3:1: error: command q expects up to 1 address(es), found 2")
-        );
+        assert!(msg.contains("input.sed:3:1: error: command only uses one address"));
     }
 
     #[test]
@@ -2029,9 +2026,7 @@ mod tests {
         let result = get_verified_cmd_spec(&lines, &line, 2, true);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("input.sed:1:1: error: command i expects up to 1 address(es), found 2")
-        );
+        assert!(msg.contains("input.sed:1:1: error: command only uses one address"));
     }
 
     // parse_number

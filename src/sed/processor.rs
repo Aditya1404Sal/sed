@@ -26,8 +26,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::rc::Rc;
-use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult, set_exit_code};
+use uucore::error::{UResult, set_exit_code};
 
 /// Return the specified command variant or panic.
 // Example: let path = extract_variant!(command, Path);
@@ -1090,8 +1089,19 @@ pub fn process_all_files(
 
     for (index, path) in files.into_iter().enumerate() {
         context.last_file = index == last_file_index;
-        let mut reader = LineReader::open(&path)
-            .map_err_context(|| format!("error opening input file {}", path.quote()))?;
+        // FA-082: GNU reports an unreadable file and keeps going — the remaining operands
+        // still get edited — rather than stopping the whole `-i`/`-s` run at the first one,
+        // which is what letting this propagate via `?` did (and left every later file
+        // untouched). Verified against the oracle: `sed -i 's/a/z/' nope a` reports
+        // `sed: can't read nope: No such file or directory`, edits `a`, and exits 2.
+        let mut reader = match LineReader::open(&path) {
+            Ok(reader) => reader,
+            Err(error) => {
+                eprintln!("sed: can't read {}: {error}", path.display());
+                set_exit_code(2);
+                continue;
+            }
+        };
         let output = in_place.begin(&path)?;
 
         if context.separate || index == 0 {

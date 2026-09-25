@@ -2003,6 +2003,24 @@ fn in_place_edit_addresses_each_file_separately() -> std::io::Result<()> {
 }
 
 #[test]
+// FA-082: an unreadable operand must not stop `-i` from editing the rest of the list — GNU
+// reports it and keeps going, exiting 2 only once every operand has had its turn.
+fn in_place_edit_continues_past_an_unreadable_file() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = dir.path().join("a");
+    let nope = dir.path().join("nope");
+    std::fs::write(&a, "a\n")?;
+
+    let result = new_ucmd!()
+        .args(&["-i", "s/a/z/", nope.to_str().unwrap(), a.to_str().unwrap()])
+        .fails();
+    result.code_is(2);
+    result.stderr_contains(format!("can't read {}", nope.display()));
+    assert_eq!(std::fs::read_to_string(&a)?, "z\n");
+    Ok(())
+}
+
+#[test]
 fn in_place_edit_backup() -> std::io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("input");

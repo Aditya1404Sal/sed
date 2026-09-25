@@ -359,7 +359,7 @@ pub fn parse_regex(
     line: &mut ScriptCharProvider,
     regex_mode: RegexMode,
 ) -> UResult<Vec<u8>> {
-    parse_regex_for_mode(lines, line, regex_mode, CharacterMode::Utf8)
+    parse_regex_for_mode(lines, line, regex_mode, CharacterMode::Utf8, false)
 }
 
 /// Parse a regular expression according to the current character mode.
@@ -368,6 +368,7 @@ pub fn parse_regex_for_mode(
     line: &mut ScriptCharProvider,
     regex_mode: RegexMode,
     character_mode: CharacterMode,
+    posix: bool,
 ) -> UResult<Vec<u8>> {
     let delimiter = scan_delimiter(lines, line)?;
     let mut result = Vec::new();
@@ -385,6 +386,14 @@ pub fn parse_regex_for_mode(
                 }
                 if line.current() == delimiter {
                     // Push escaped delimiter
+                    result.push(line.current_byte());
+                    line.advance();
+                    continue;
+                }
+                // `--posix` turns off the GNU BRE/ERE extensions `\+`, `\?` and `\|`
+                // (one-or-more, zero-or-one, alternation): POSIX doesn't define them, so
+                // GNU sed matches them as plain literal characters instead.
+                if posix && matches!(line.current(), '+' | '?' | '|') {
                     result.push(line.current_byte());
                     line.advance();
                     continue;

@@ -2542,6 +2542,29 @@ fn test_addr0_second_re_only() {
 }
 
 #[test]
+fn test_addr0_step_of_zero_is_still_address_0_misuse() {
+    // `0~N` for a real step N is a legitimate GNU extension (every Nth line), but `0~0` names no
+    // step at all and is address-0 misuse like any other bare `0` address — verified against the
+    // oracle: status 1, char 4 (right after `0~0`).
+    new_ucmd!()
+        .args(&["0~0p"])
+        .fails()
+        .code_is(1)
+        .stderr_is("sed: -e expression #1, char 4: invalid usage of line address 0\n");
+}
+
+#[test]
+fn test_addr0_step_nonzero_is_a_valid_extension() {
+    // The counterpart to the above: `0~2` is not address-0 misuse, and picks every even line,
+    // verified against the oracle.
+    new_ucmd!()
+        .args(&["-n", "0~2p"])
+        .pipe_in("a\nb\nc\nd\n")
+        .succeeds()
+        .stdout_is("b\nd\n");
+}
+
+#[test]
 fn test_step_match_non_posix() {
     // Under --posix, `~` isn't address syntax at all (not even to report it as a disabled
     // extension) — it just falls through and reads as the next command, which isn't a real

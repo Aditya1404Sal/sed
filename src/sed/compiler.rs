@@ -523,7 +523,16 @@ fn compile_address_range(
                 0 // dummy, not used
             };
 
-            if is_line0 && (context.posix || (!matches!(addr2, Address::Re(_)) && !is_step_match)) {
+            // `0~N` for a real step `N` is a legitimate GNU extension (every Nth line, as if
+            // counting from a line 0), but `0~0` names no step at all and is address-0 misuse
+            // just like `0,/re/` under --posix — verified against the oracle: `0~0p` ->
+            // "invalid usage of line address 0" at char 4 (right after `0~0`), status 1, while
+            // `0~2p` runs and matches every even line as usual.
+            if is_line0
+                && (context.posix
+                    || (!matches!(addr2, Address::Re(_)) && !is_step_match)
+                    || (is_step_match && step_n == 0))
+            {
                 return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
             }
 

@@ -16,6 +16,7 @@ use assert_fs::fixture::{FileWriteStr, PathChild};
 
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
+use uutests::at_and_ucmd;
 use uutests::new_ucmd;
 
 ////////////////////////////////////////////////////////////
@@ -2629,11 +2630,28 @@ fn test_unterminated_posix_class_in_s_pattern_matches_gnus_wording() {
 
 #[test]
 fn test_write_file_failure() {
+    // Status 4 and this bare, unquoted, unprefixed wording, verified against the oracle: a `w`
+    // target that can't be opened is the same "couldn't set up a needed file" family as a
+    // missing `-f` script file, not a script syntax error and not the generic status-2 a `w`
+    // write that starts out fine but later fails would get.
     new_ucmd!()
         .args(&["w /xyzzy/xyzy", LINES1])
         .fails()
-        .code_is(2)
-        .stderr_contains("sed: -e expression #1, char 1: creating file '/xyzzy/xyzy':");
+        .code_is(4)
+        .stderr_is("sed: couldn't open file /xyzzy/xyzy: No such file or directory\n");
+}
+
+#[test]
+fn test_write_file_to_directory_failure() {
+    // A `w` target that names an existing directory, verified against the oracle: same status-4
+    // family and message shape as a `w` target whose parent doesn't exist, just a different
+    // underlying OS reason ("Is a directory" rather than "No such file or directory").
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("a_directory");
+    ucmd.args(&["w a_directory", LINES1])
+        .fails()
+        .code_is(4)
+        .stderr_is("sed: couldn't open file a_directory: Is a directory\n");
 }
 
 #[test]

@@ -49,8 +49,22 @@ impl NamedWriter {
             .truncate(true)
             .open(&path)
             .map_err(|e| {
-                runtime_error::<()>(&location, format!("creating file {}: {}", path.quote(), e))
-                    .unwrap_err()
+                // GNU's own wording and exit status for failing to open a `w`/`W` target,
+                // verified against the oracle (`sed 'w /tmp/d'` where `/tmp/d` is a directory ->
+                // "couldn't open file /tmp/d: Is a directory", status 4, with the path bare
+                // (unquoted, even with a space in it) and no `-e expression #N` location prefix
+                // at all — the same status-4 "couldn't set up a needed file" family as a missing
+                // `-f` script file, not the generic status-2 `runtime_error` a `w` write that
+                // starts out fine but later fails (a full disk, say) would get. `io::Error`'s own
+                // `Display` appends a "(os error N)" suffix under wasm32-wasip2 that GNU's own
+                // message never has, so it's stripped the same way `script_line_provider.rs`'s
+                // `-f`-file-open path already does.
+                let text = e.to_string();
+                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                uucore::error::USimpleError::new(
+                    4,
+                    format!("couldn't open file {}: {text}", path.display()),
+                )
             })?;
 
         let writer = Rc::new(RefCell::new(NamedWriter {

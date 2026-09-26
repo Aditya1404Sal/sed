@@ -2604,6 +2604,30 @@ fn test_fancy_regex_captures_iter_error() {
 }
 
 #[test]
+fn test_unterminated_y_command_matches_gnus_wording() {
+    // Verified against the oracle: an unterminated `y` command gets its own wording, the same
+    // way an unterminated `s` command does, rather than the generic "unterminated transliteration
+    // string" `parse_transliteration_bytes` raises internally.
+    new_ucmd!()
+        .args(&["y/a", LINES1])
+        .fails()
+        .code_is(1)
+        .stderr_is("sed: -e expression #1, char 3: unterminated `y' command\n");
+}
+
+#[test]
+fn test_unterminated_posix_class_in_s_pattern_matches_gnus_wording() {
+    // Verified against the oracle: an unclosed POSIX class inside an `s` pattern is reported as
+    // the same `` unterminated `s' command `` as any other unterminated regex, not a
+    // class-specific message.
+    new_ucmd!()
+        .args(&["s/[[:alpha/x/", LINES1])
+        .fails()
+        .code_is(1)
+        .stderr_is("sed: -e expression #1, char 13: unterminated `s' command\n");
+}
+
+#[test]
 fn test_write_file_failure() {
     new_ucmd!()
         .args(&["w /xyzzy/xyzy", LINES1])

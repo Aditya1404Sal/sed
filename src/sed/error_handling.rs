@@ -153,18 +153,22 @@ pub fn input_runtime_error<T>(
 }
 
 /// Replace a `compilation_error`'s own generic message with a context-specific one, keeping
-/// its location prefix and exit code — used where `parse_regex_for_mode`/`parse_character_class`
-/// raise the same "unterminated regular expression"/"Unterminated bracket expression" whether
-/// they were called for a command address or an `s` command's pattern, but GNU's own wording
-/// for hitting end of input differs by which one it was (verified against the oracle:
-/// `sed '/unterminated'` -> "unterminated address regex", `sed 's/a'` -> `` unterminated `s'
-/// command ``, both including for an unterminated bracket expression within the regex).
+/// its location prefix and exit code — used where `parse_regex_for_mode`/`parse_character_class`/
+/// `parse_transliteration_bytes` raise the same generic "unterminated ..." message whether they
+/// were called for a command address, an `s` command's pattern, or a `y` command's operand, but
+/// GNU's own wording for hitting end of input differs by which one it was (verified against the
+/// oracle: `sed '/unterminated'` -> "unterminated address regex", `sed 's/a'` -> `` unterminated
+/// `s' command ``, `sed 'y/a'` -> `` unterminated `y' command ``, `sed 's/[[:alpha/x/'` (an
+/// unclosed POSIX class inside an `s` pattern) -> the same `` unterminated `s' command `` as any
+/// other unterminated regex, not a class-specific message).
 pub fn remap_unterminated<T>(result: UResult<T>, replacement: &str) -> UResult<T> {
     result.map_err(|error| {
         let message = error.to_string();
         for generic in [
             "unterminated regular expression",
             "Unterminated bracket expression",
+            "unterminated transliteration string",
+            "Unterminated POSIX character class, equivalence or collating symbol",
         ] {
             if let Some(prefix) = message.strip_suffix(generic) {
                 return USimpleError::new(1, format!("{prefix}{replacement}"));

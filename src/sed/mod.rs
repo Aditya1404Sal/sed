@@ -104,12 +104,15 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
 #[allow(clippy::cognitive_complexity)]
 pub fn uu_app() -> Command {
-    #[cfg(windows)]
-    let util_name = "sed";
-    #[cfg(not(windows))]
-    let util_name = uucore::util_name();
-
-    Command::new(util_name)
+    // Always the literal "sed", not `uucore::util_name()` (which the Windows build already
+    // hardcodes around): `util_name()` reads a `LazyLock` seeded once, forever, from the
+    // process's real argv[0] the first time ANY uucore tool asks for it — the right thing for
+    // a real multicall coreutils binary, but wrong here, where this crate is one of several
+    // different tools' engines called as plain library functions inside one long-lived
+    // embedding process (Golem's bash tool). Whichever uucore-based tool happens to run first
+    // in a session wins that name for every tool after it: verified against the oracle harness,
+    // `wc --version; sed --version` in one script prints "wc 0.2.0 (uutils)" for sed's own line.
+    Command::new("sed")
         .version(VERSION)
         .about(ABOUT)
         .override_usage(format_usage(USAGE))
@@ -636,5 +639,17 @@ mod tests {
                 .contains("unsupported locale: el_GR.ISO-8859-7"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn uu_app_name_is_always_sed() {
+        // Not `uucore::util_name()`: an embedder that calls several different uucore-based
+        // tools as plain library functions inside one long-lived process (rather than
+        // re-executing a fresh multicall binary per tool, as `util_name()`'s own caching
+        // assumes) would otherwise have this crate's `--version`/usage-error text report
+        // whichever OTHER uucore tool ran first in that process, not "sed" — verified against
+        // that harness directly (`wc --version; sed --version` printed "wc 0.2.0 (uutils)" for
+        // sed's own line before this fix).
+        assert_eq!(uu_app().get_name(), "sed");
     }
 }

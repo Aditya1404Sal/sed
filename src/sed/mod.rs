@@ -16,6 +16,7 @@ pub mod fast_io;
 pub mod fast_regex;
 pub mod in_place;
 pub mod incremental;
+pub mod named_reader;
 pub mod named_writer;
 pub mod processor;
 pub mod script_char_provider;
@@ -103,19 +104,28 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
 #[allow(clippy::cognitive_complexity)]
 pub fn uu_app() -> Command {
-    #[cfg(windows)]
-    let util_name = "sed";
-    #[cfg(not(windows))]
-    let util_name = uucore::util_name();
-
-    Command::new(util_name)
+    // Always the literal "sed", not `uucore::util_name()` (which the Windows build already
+    // hardcodes around): `util_name()` reads a `LazyLock` seeded once, forever, from the
+    // process's real argv[0] the first time ANY uucore tool asks for it — the right thing for
+    // a real multicall coreutils binary, but wrong here, where this crate is one of several
+    // different tools' engines called as plain library functions inside one long-lived
+    // embedding process (Golem's bash tool). Whichever uucore-based tool happens to run first
+    // in a session wins that name for every tool after it: verified against the oracle harness,
+    // `wc --version; sed --version` in one script prints "wc 0.2.0 (uutils)" for sed's own line.
+    Command::new("sed")
         .version(VERSION)
         .about(ABOUT)
         .override_usage(format_usage(USAGE))
         .args_override_self(true)
         .infer_long_args(true)
         .args([
-            arg!([script] "Script to execute if not otherwise provided."),
+            // `OsString`-typed: this argument doubles as the script's literal *bytes* (the
+            // first-POSIX-form `sed SCRIPT [file...]`) or, when `-e`/`-f` supplied the script
+            // instead, as an input file's path — either way, raw bytes, not text a `String`
+            // value_parser would refuse to hold. See `expression` (`-e`) for the same reason.
+            Arg::new("script")
+                .help("Script to execute if not otherwise provided.")
+                .value_parser(clap::value_parser!(OsString)),
             Arg::new("file")
                 .help("Input files")
                 .value_parser(clap::value_parser!(PathBuf))
@@ -132,7 +142,12 @@ pub fn uu_app() -> Command {
                 .short_alias('r')
                 .help("Use extended regular expressions.")
                 .action(clap::ArgAction::SetTrue),
-            arg!(-e --expression <SCRIPT> "Add script to executed commands.")
+            Arg::new("expression")
+                .short('e')
+                .long("expression")
+                .value_name("SCRIPT")
+                .help("Add script to executed commands.")
+                .value_parser(clap::value_parser!(OsString))
                 .action(clap::ArgAction::Append),
             // Access with .get_many::<PathBuf>("file")
             Arg::new("script-file")
@@ -191,24 +206,33 @@ fn get_scripts_files(matches: &ArgMatches) -> UResult<(Vec<ScriptValue>, Vec<Pat
         // Second and third POSIX usage cases; clap script arg is actually an input file
         // sed [-En] -e script [-e script]... [-f script_file]... [file...]
         // sed [-En] [-e script]... -f script_file [-f script_file]... [file...]
-        if let Some(val) = matches.get_one::<String>("script") {
+        if let Some(val) = matches.get_one::<OsString>("script") {
             files.push(PathBuf::from(val.to_owned()));
         }
     } else {
         // First POSIX spec usage case; script is the first arg.
         // sed [-En] script [file...]
-        if let Some(val) = matches.get_one::<String>("script") {
-            indexed_scripts.push((0, ScriptValue::StringVal(val.to_owned())));
+        if let Some(val) = matches.get_one::<OsString>("script") {
+            indexed_scripts.push((
+                0,
+                ScriptValue::StringVal(val.to_owned().into_encoded_bytes()),
+            ));
         } else {
             return Err(UUsageError::new(1, "missing script"));
         }
     }
 
-    // Capture -e occurrences (STRING)
+    // Capture -e occurrences (bytes, not text: see `expression`'s own value_parser)
     if let Some(indices) = matches.indices_of("expression") {
-        for (idx, val) in indices.zip(matches.get_many::<String>("expression").unwrap_or_default())
-        {
-            indexed_scripts.push((idx, ScriptValue::StringVal(val.to_owned())));
+        for (idx, val) in indices.zip(
+            matches
+                .get_many::<OsString>("expression")
+                .unwrap_or_default(),
+        ) {
+            indexed_scripts.push((
+                idx,
+                ScriptValue::StringVal(val.to_owned().into_encoded_bytes()),
+            ));
         }
     }
 
@@ -240,8 +264,15 @@ fn get_scripts_files(matches: &ArgMatches) -> UResult<(Vec<ScriptValue>, Vec<Pat
         files.extend(rest_files);
     }
 
-    // Read from stdin if no file has been specified.
+    // Read from stdin if no file has been specified — except under -i/--in-place, where
+    // there's no real file to write the edit back to, so GNU refuses outright instead of
+    // quietly trying (and failing) to in-place-edit "-" — verified against the oracle
+    // (`sed -i 's/a/b/'`, `sed -i p`, `sed -i.bak 's/a/b/'`, `sed --follow-symlinks -i
+    // 's/a/b/'` all give "no input files" at status 4, not a file-open error naming "-").
     if files.is_empty() {
+        if matches.contains_id("in-place") {
+            return Err(USimpleError::new(4, "no input files"));
+        }
         files.push(PathBuf::from("-"));
     }
 
@@ -307,7 +338,10 @@ fn build_context(matches: &ArgMatches) -> UResult<ProcessingContext> {
         length: matches.get_one::<u32>("length").map_or(70, |v| *v as usize),
         quiet: matches.get_flag("quiet"),
         posix: matches.get_flag("posix"),
-        separate: matches.get_flag("separate"),
+        // `-i` edits each file into its own separate output, so GNU treats each one as
+        // its own address stream even without an explicit `-s`: line numbers restart and
+        // `$` matches each file's own last line, not just the last file's.
+        separate: matches.get_flag("separate") || matches.contains_id("in-place"),
         sandbox: matches.get_flag("sandbox"),
         no_exec: !cfg!(any(unix, windows)),
         unbuffered: matches.get_flag("unbuffered"),
@@ -355,7 +389,7 @@ mod tests {
         let matches = get_test_matches(&["1d", "file1.txt"]);
         let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-        assert_eq!(scripts, vec![ScriptValue::StringVal("1d".to_string())]);
+        assert_eq!(scripts, vec![ScriptValue::StringVal(b"1d".to_vec())]);
         assert_eq!(files, vec![PathBuf::from("file1.txt")]);
     }
 
@@ -366,7 +400,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(files, vec![PathBuf::from("file1.txt")]);
     }
@@ -390,7 +424,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(
             files,
@@ -405,7 +439,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(
             files,
@@ -420,7 +454,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(files, vec![PathBuf::from("-")]); // Stdin should be used
     }
@@ -432,7 +466,7 @@ mod tests {
 
         assert_eq!(
             scripts,
-            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+            vec![ScriptValue::StringVal(b"s/foo/bar/".to_vec())]
         );
         assert_eq!(files, vec![PathBuf::from("-")]); // Stdin should be used
     }
@@ -542,7 +576,7 @@ mod tests {
         let (scripts, files) = get_scripts_files(&matches).unwrap();
         assert!(ctx.in_place);
         assert_eq!(ctx.in_place_suffix, None);
-        assert_eq!(scripts, vec![ScriptValue::StringVal("s/a/b/".to_string())]);
+        assert_eq!(scripts, vec![ScriptValue::StringVal(b"s/a/b/".to_vec())]);
         assert_eq!(files, vec![PathBuf::from("file.txt")]);
     }
 
@@ -605,5 +639,17 @@ mod tests {
                 .contains("unsupported locale: el_GR.ISO-8859-7"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn uu_app_name_is_always_sed() {
+        // Not `uucore::util_name()`: an embedder that calls several different uucore-based
+        // tools as plain library functions inside one long-lived process (rather than
+        // re-executing a fresh multicall binary per tool, as `util_name()`'s own caching
+        // assumes) would otherwise have this crate's `--version`/usage-error text report
+        // whichever OTHER uucore tool ran first in that process, not "sed" — verified against
+        // that harness directly (`wc --version; sed --version` printed "wc 0.2.0 (uutils)" for
+        // sed's own line before this fix).
+        assert_eq!(uu_app().get_name(), "sed");
     }
 }

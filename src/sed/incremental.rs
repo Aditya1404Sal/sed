@@ -62,7 +62,25 @@ impl Engine {
     /// script. Returns the engine and its input operands; `-` names
     /// standard input. The `e` command and `s///e` flag are refused.
     pub fn new(args: impl uucore::Args) -> UResult<(Self, Vec<PathBuf>)> {
-        let matches = uu_app().try_get_matches_from(normalize_in_place(args))?;
+        // FB-077: a bare `?` here would let `clap::Error` auto-convert into uucore's own
+        // `ClapErrorWrapper` (`impl From<clap::Error> for Box<dyn UError>`) — whose `Display`
+        // impl calls `clap::Error::print()` as a side effect (its own doc comment: "this is
+        // abuse of the Display trait"). `print()` writes straight to the real process
+        // stdout/stderr, bypassing whatever redirection or capture the embedder set up for
+        // this call entirely — `--help`/`--version` text (and any usage error) leaks out
+        // unredirected and unpiped, and the message `Display` actually returns is empty.
+        // `clap::Error`'s own `Display` has no such side effect, so build the message from
+        // that instead, before the wrapper ever gets a chance to. The status code mirrors
+        // `ClapErrorWrapper::code`'s own convention exactly (0 for `--help`/`--version`,
+        // since GNU exits 0 for both; 1 for every other clap usage error) rather than
+        // `clap::Error::exit_code()`, which is 2 for a plain usage error — GNU's sed uses 1.
+        let matches = uu_app()
+            .try_get_matches_from(normalize_in_place(args))
+            .map_err(|error| {
+                use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
+                let code = i32::from(!matches!(error.kind(), DisplayHelp | DisplayVersion));
+                uucore::error::USimpleError::new(code, error.to_string())
+            })?;
         let (scripts, files) = get_scripts_files(&matches)?;
         let mut context = build_context(&matches)?;
         context.no_exec = true;
@@ -71,7 +89,8 @@ impl Engine {
         let commands = compile(scripts, &mut context)?;
         let needs_last = uses_last_line(commands.as_ref());
         let sink = Rc::new(RefCell::new(Vec::new()));
-        let output = OutputBuffer::from_writer(Box::new(Sink(Rc::clone(&sink))));
+        let mut output = OutputBuffer::from_writer(Box::new(Sink(Rc::clone(&sink))));
+        output.set_delimiter(if context.null_data { b'\0' } else { b'\n' });
         Ok((
             Self {
                 commands,
@@ -100,6 +119,13 @@ impl Engine {
     /// (`$` addresses, `n` and `c`), so the embedder must read one line ahead.
     pub fn needs_last(&self) -> bool {
         self.needs_last
+    }
+
+    /// Tell the engine which file the next record it's handed comes from, for the `F`
+    /// command. Addressing (line numbers, `$`) still spans every operand as one stream,
+    /// as GNU sed does without `-s`: only this display name changes at a file boundary.
+    pub fn set_input_name(&mut self, name: impl Into<PathBuf>) {
+        self.context.input_name = name.into();
     }
 
     /// Process one input line, including its delimiter if present, and
@@ -136,12 +162,19 @@ impl Engine {
         if !self.context.quiet
             && !self.context.stop_processing
             && let Some(InputAction {
-                prepend: Some(mut pending),
+                prepend: Some(pending),
+                terminated,
                 ..
             }) = self.context.input_action.take()
         {
-            pending.push(b'\n');
-            self.output.write_bytes(&pending)?;
+            // Preserve the input's own "last line has no terminator" property
+            // (FB-078/FA-077): `write_chunk` (not `write_bytes`, which sniffs
+            // `bytes.ends_with(b"\n")` — wrong for `-z`, and wouldn't see a terminator this
+            // code appended itself anyway) only adds one back if the line `N` read it from
+            // actually had one, e.g. `printf 'a' | sed 'N'` (no trailing newline) must not
+            // gain one just because `N` never got a next line to join it with.
+            self.output
+                .write_chunk(&IOChunk::from_bytes(pending, terminated))?;
         }
         named_writer::flush_all()?;
         self.take(out)
@@ -254,6 +287,19 @@ mod tests {
         assert_eq!(run(&["s/h./H/"], "héllo\n").0, "Hllo\n");
         assert_eq!(run(&["-E", r"s/(ab)\1/X/"], "abab\n").0, "X\n");
         crate::sed::set_locale(None);
+    }
+
+    #[test]
+    fn set_input_name_changes_what_f_prints() {
+        let argv = ["sed", "F"].map(std::ffi::OsString::from);
+        let (mut engine, _) = Engine::new(argv.into_iter()).unwrap();
+        let mut out = Vec::new();
+        engine.set_input_name("a.txt");
+        engine.record(b"1\n", false, &mut out).unwrap();
+        engine.set_input_name("b.txt");
+        engine.record(b"2\n", true, &mut out).unwrap();
+        engine.finish(&mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a.txt\n1\nb.txt\n2\n");
     }
 
     #[test]

@@ -15,10 +15,13 @@ use crate::sed::command::{
 };
 use crate::sed::delimited_parser::{
     os_string_from_bytes, parse_char_escape, parse_regex_for_mode, parse_transliteration_for_mode,
-    push_script_char,
+    push_escaped_char,
 };
-use crate::sed::error_handling::{ScriptLocation, compilation_error, semantic_error};
+use crate::sed::error_handling::{
+    ScriptLocation, compilation_error, location_prefix, remap_unterminated,
+};
 use crate::sed::fast_regex::Regex;
+use crate::sed::named_reader::NamedReader;
 use crate::sed::named_writer::NamedWriter;
 use crate::sed::script_char_provider::ScriptCharProvider;
 use crate::sed::script_line_provider::{ScriptLineProvider, ScriptValue};
@@ -28,19 +31,29 @@ use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use terminal_size::{Width, terminal_size};
 use uucore::error::{UResult, USimpleError};
 
-const DEFAULT_OUTPUT_WIDTH: usize = 60;
-
-const ERR_ADDRESS_0_USAGE: &str =
-    "address 0 can only be used with ~step, a second regular expression, or a read command";
-const ERR_SANDBOX: &str = "command not allowed with --sandbox";
+// GNU's own wording, verified against the oracle for a bare `0p`, `0,5p`, and `--posix
+// 0,/foo/p` (posix disables the whole address-0 extension, so every use of it fails, not just
+// the ones the non-posix message describes) — all three report this exact text, not a
+// description of what *would* have been valid.
+const ERR_ADDRESS_0_USAGE: &str = "invalid usage of line address 0";
+const ERR_SANDBOX: &str = "e/r/w commands disabled in sandbox mode";
 const ERR_NO_EXEC: &str =
     "the 'e' command and substitute flag are unsupported here: no shell to run";
 
-const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to 's'";
-const ERR_TRANSLITERATION_LENGTH: &str = "transliteration strings are not the same length";
+const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to `s'";
+const ERR_TRANSLITERATION_LENGTH: &str = "strings for `y' command are different lengths";
+// `compile_sequence` and the post-parse tree walks (`populate_label_map` and friends)
+// all use their own heap-allocated work stacks now, not the native call stack, so this
+// cap isn't there to protect them. It exists because dropping the compiled `Command`
+// chain still isn't: `Command`'s fields (`.next`, and `.data`'s `BranchTarget`) are
+// `Rc<RefCell<Command>>`, so Rust's derived drop glue frees a deeply nested chain with
+// one native stack frame per level, which measurably overflows the WASI stack somewhere
+// between 8,000 and 10,000 levels. 5,000 is comfortably below that, and comfortably
+// above any script a person would write by hand.
+const MAX_BLOCK_NESTING: usize = 5_000;
+const ERR_BLOCK_NESTING_TOO_DEEP: &str = "`{' blocks are nested too deeply";
 
 // Handling required after processing a command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +101,22 @@ pub fn compile(
     // This converts the tree into a graph, so it must be the last
     // conversion that traverses the structure as a tree.
     if context.parsed_block_nesting > 0 {
-        return Err(USimpleError::new(1, "unmatched `{'"));
+        // GNU's own wording, verified against the oracle: `sed: -e expression #1, char 0:
+        // unmatched `{'` — this fires after `compile_sequence` has already collapsed every
+        // open frame at true EOF (see its own comment), so there's no live `ScriptCharProvider`
+        // position left to report; `lines`'s own last-active source/line (its `last_input_name`
+        // fallback) is still there, and char 0 is GNU's own sentinel here (not a real column).
+        return Err(USimpleError::new(
+            1,
+            format!(
+                "{}: unmatched `{{'",
+                location_prefix(
+                    make_providers.get_input_name(),
+                    make_providers.get_line_number(),
+                    0
+                )
+            ),
+        ));
     }
     patch_block_endings(result.clone());
 
@@ -96,33 +124,39 @@ pub fn compile(
 }
 
 /// For every Command in the top-level `head` chain, look for
-/// `CommandData::BranchTarget(Some(sub_head))` '{' commands.
-/// Recursively patch the sub-chain, then splice its tail back to the
-/// original “next” pointer of the *parent* (falling back to its own
-/// parent_next if its own next was `None`).
+/// `CommandData::BranchTarget(Some(sub_head))` '{' commands, and splice each one's tail
+/// back to the original "next" pointer of its *parent* (falling back to the parent's own
+/// splice target if its own next was `None`).
+///
+/// Two passes, rather than one recursive walk that splices as it goes (deep nesting
+/// would overflow the native stack under WASI): the first only reads `.next` — including
+/// each nested block's own `own_next`, which a splice would otherwise overwrite before
+/// that block gets its turn — and records every splice this pass would have made; the
+/// second applies them. Since a splice never depends on another splice (a block's tail
+/// is only ever the target of the one enclosing splice that closes it), any order in the
+/// second pass gives the same result as the recursive original.
 fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
-    fn patch_block_endings_to_parent(
-        mut cur: Option<Rc<RefCell<Command>>>,
-        parent_next: Option<Rc<RefCell<Command>>>,
-    ) {
+    type Link = Option<Rc<RefCell<Command>>>;
+    let mut writes: Vec<(Rc<RefCell<Command>>, Link)> = Vec::new();
+    // (chain to walk, that chain's own fallback splice target)
+    let mut pending: Vec<(Link, Link)> = vec![(head, None)];
+    while let Some((mut cur, parent_next)) = pending.pop() {
         while let Some(rc_cmd) = cur {
-            // Borrow mutably just long enough to inspect/rewire this node
-            let cmd = rc_cmd.borrow_mut();
+            // A read-only borrow: this pass never mutates `.next`.
+            let cmd = rc_cmd.borrow();
             // Save this node’s own next pointer
             let own_next = cmd.next.clone();
             // Decide what “splice target” to use:
             //   - if this node has its own_next, use that
             //   - otherwise, fall back to parent_next
-            let splice_target = own_next.clone().or(parent_next.clone());
+            let splice_target = own_next.clone().or_else(|| parent_next.clone());
 
-            // If it has a sub-block, recurse and then patch its tail
+            // If it has a sub-block, record its tail's splice and queue its body to have
+            // its own nested blocks' splices recorded.
             if let CommandData::BranchTarget(Some(ref sub_head)) = cmd.data
                 && cmd.code == '{'
             {
-                // 1) recurse into the sub-chain, passing splice_target
-                patch_block_endings_to_parent(Some(sub_head.clone()), splice_target.clone());
-
-                // 2) find the tail of that sub-chain
+                // find the tail of that sub-chain
                 let mut tail = sub_head.clone();
                 loop {
                     let next_in_sub = tail.borrow().next.clone();
@@ -132,8 +166,8 @@ fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
                     }
                 }
 
-                // 3) splice the tail’s `.next` to splice_target
-                tail.borrow_mut().next.clone_from(&splice_target);
+                writes.push((tail, splice_target.clone()));
+                pending.push((Some(sub_head.clone()), splice_target));
             }
 
             // drop the borrow before moving on
@@ -144,121 +178,169 @@ fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
         }
     }
 
-    // top-level has no parent, so pass None
-    patch_block_endings_to_parent(head, None);
+    for (tail, target) in writes {
+        tail.borrow_mut().next = target;
+    }
 }
 
-/// Populate the context's label map with references to associated commands.
+/// Populate the context's label map with references to associated commands. Descends
+/// into `{`-nested chains with an explicit worklist rather than recursing (deep nesting
+/// would otherwise overflow the native stack under WASI), pushing each nested chain to
+/// visit later instead of visiting it immediately.
 fn populate_label_map(
-    mut cur: Option<Rc<RefCell<Command>>>,
+    head: Option<Rc<RefCell<Command>>>,
     context: &mut ProcessingContext,
 ) -> UResult<()> {
-    while let Some(rc_cmd) = cur.take() {
-        // Borrow mutably just long enough to inspect/rewire this node
-        let cmd = rc_cmd.borrow_mut();
+    let mut pending = vec![head];
+    while let Some(mut cur) = pending.pop() {
+        while let Some(rc_cmd) = cur.take() {
+            // Borrow mutably just long enough to inspect/rewire this node
+            let cmd = rc_cmd.borrow_mut();
 
-        // Extract any label to insert after borrow ends
-        let maybe_label = match &cmd.data {
-            CommandData::BranchTarget(Some(sub_head)) => {
-                populate_label_map(Some(sub_head.clone()), context)?;
-                None
-            }
-            CommandData::Label(Some(label)) => Some(label.clone()),
-            _ => None,
-        };
+            // Extract any label to insert after borrow ends
+            let maybe_label = match &cmd.data {
+                CommandData::BranchTarget(Some(sub_head)) => {
+                    pending.push(Some(sub_head.clone()));
+                    None
+                }
+                CommandData::Label(Some(label)) => Some(label.clone()),
+                _ => None,
+            };
 
-        if let Some(label) = maybe_label
-            && cmd.code == ':'
-        {
-            if context.label_to_command_map.contains_key(&label) {
-                return semantic_error(&cmd.location, format!("duplicate label `{label}'"));
+            if let Some(label) = maybe_label
+                && cmd.code == ':'
+            {
+                // GNU doesn't refuse a duplicate label — verified against the oracle
+                // (`sed ':lbl;:lbl'` compiles and runs with no error at all). A later
+                // definition simply overwrites the map entry, the same as this insert already
+                // did before this comment; only the refusal itself was wrong.
+                context.label_to_command_map.insert(label, rc_cmd.clone());
             }
-            context.label_to_command_map.insert(label, rc_cmd.clone());
+
+            cur.clone_from(&cmd.next);
         }
-
-        cur.clone_from(&cmd.next);
     }
     Ok(())
 }
 
-/// Populate the context's address range command list with references to associated commands.
-fn populate_range_commands(mut cur: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
-    while let Some(rc_cmd) = cur.take() {
-        // Borrow mutably just long enough to inspect/rewire this node
-        let cmd = rc_cmd.borrow_mut();
+/// Populate the context's address range command list with references to associated
+/// commands. See [`populate_label_map`] for why `{`-nested chains go on a worklist
+/// instead of a recursive call.
+fn populate_range_commands(head: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
+    let mut pending = vec![head];
+    while let Some(mut cur) = pending.pop() {
+        while let Some(rc_cmd) = cur.take() {
+            // Borrow mutably just long enough to inspect/rewire this node
+            let cmd = rc_cmd.borrow_mut();
 
-        // Recursively process blocks.
-        if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
-            populate_range_commands(Some(Rc::clone(sub_head)), context);
+            if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
+                pending.push(Some(Rc::clone(sub_head)));
+            }
+
+            if cmd.addr2.is_some() {
+                // Save detected range command.
+                context.range_commands.push(Rc::clone(&rc_cmd));
+            }
+
+            cur.clone_from(&cmd.next);
         }
-
-        if cmd.addr2.is_some() {
-            // Save detected range command.
-            context.range_commands.push(Rc::clone(&rc_cmd));
-        }
-
-        cur.clone_from(&cmd.next);
     }
 }
 
 /// Replace branch labels with references to the corresponding commands.
-/// Raise an error on undefined labels.
+/// Raise an error on undefined labels. See [`populate_label_map`] for why `{`-nested
+/// chains go on a worklist instead of a recursive call.
 fn resolve_branch_targets(
-    mut cur: Option<Rc<RefCell<Command>>>,
+    head: Option<Rc<RefCell<Command>>>,
     context: &mut ProcessingContext,
 ) -> UResult<()> {
-    while let Some(rc_cmd) = cur.take() {
-        // Borrow mutably just long enough to inspect/rewire this node
-        let mut cmd = rc_cmd.borrow_mut();
+    let mut pending = vec![head];
+    while let Some(mut cur) = pending.pop() {
+        while let Some(rc_cmd) = cur.take() {
+            // Borrow mutably just long enough to inspect/rewire this node
+            let mut cmd = rc_cmd.borrow_mut();
 
-        // Recurse into blocks
-        if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
-            resolve_branch_targets(Some(sub_head.clone()), context)?;
+            if let CommandData::BranchTarget(Some(sub_head)) = &cmd.data {
+                pending.push(Some(sub_head.clone()));
+            }
+
+            // Only for 't', 'T', or 'b' commands:
+            if matches!(cmd.code, 't' | 'T' | 'b') {
+                // Take ownership of the current data
+                let old_data = mem::replace(&mut cmd.data, CommandData::None);
+
+                // Build the replacement
+                let new_data = match old_data {
+                    CommandData::Label(Some(label)) => {
+                        let target = context
+                            .label_to_command_map
+                            .get(&label)
+                            .cloned()
+                            .ok_or_else(|| {
+                                // GNU's own wording, exit status, and lack of any `-e expression
+                                // #N, char C:` location prefix — verified against the oracle for
+                                // b, t and T. Unlike every other error this fork raises for a
+                                // script problem, GNU doesn't treat an unresolved branch target
+                                // as a script *syntax* error (status 1, tied to where it was
+                                // written); it's a late-binding setup failure, the same status-4
+                                // family as a missing -f file or -i with no input files.
+                                USimpleError::new(
+                                    4,
+                                    format!("can't find label for jump to `{label}'"),
+                                )
+                            })?;
+                        CommandData::BranchTarget(Some(target))
+                    }
+                    CommandData::Label(None) => CommandData::BranchTarget(None),
+                    other => other, // put back anything else unchanged
+                };
+
+                // Store it back
+                cmd.data = new_data;
+            }
+
+            // Advance to the next sibling
+            cur.clone_from(&cmd.next);
         }
-
-        // Only for 't', 'T', or 'b' commands:
-        if matches!(cmd.code, 't' | 'T' | 'b') {
-            // Take ownership of the current data
-            let old_data = mem::replace(&mut cmd.data, CommandData::None);
-
-            // Build the replacement
-            let new_data = match old_data {
-                CommandData::Label(Some(label)) => {
-                    let target = context
-                        .label_to_command_map
-                        .get(&label)
-                        .cloned()
-                        .ok_or_else(|| {
-                            semantic_error::<()>(
-                                &cmd.location,
-                                format!("undefined label `{label}'"),
-                            )
-                            .unwrap_err()
-                        })?;
-                    CommandData::BranchTarget(Some(target))
-                }
-                CommandData::Label(None) => CommandData::BranchTarget(None),
-                other => other, // put back anything else unchanged
-            };
-
-            // Store it back
-            cmd.data = new_data;
-        }
-
-        // Advance to the next sibling
-        cur.clone_from(&cmd.next);
     }
     Ok(())
 }
 
 /// Compile provided scripts into a sequence of commands.
+/// One `{ ... }` nesting level's partial command list, plus (for every level but the
+/// outermost) the `{` command whose `BranchTarget` gets this level's head once it closes.
+struct CompileFrame {
+    head: Option<Rc<RefCell<Command>>>,
+    tail: Option<Rc<RefCell<Command>>>,
+    opener: Option<Rc<RefCell<Command>>>,
+}
+
+impl CompileFrame {
+    fn link(&mut self, cmd: Rc<RefCell<Command>>) {
+        if let Some(ref t) = self.tail {
+            t.borrow_mut().next = Some(cmd.clone());
+        } else {
+            self.head = Some(cmd.clone());
+        }
+        self.tail = Some(cmd);
+    }
+}
+
+/// Compile a `{ ... }`-nested sequence of commands. `{` and `}` push and pop a frame on
+/// `stack` instead of recursing natively: GNU sed's own compiler doesn't recurse for
+/// nesting either, and a few thousand levels (well within what one `sed -f` script might
+/// contain) would overflow a native call stack under WASI, where a Golem agent has no
+/// way to recover from that trap.
 fn compile_sequence(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
     context: &mut ProcessingContext,
 ) -> UResult<Option<Rc<RefCell<Command>>>> {
-    let mut head: Option<Rc<RefCell<Command>>> = None;
-    let mut tail: Option<Rc<RefCell<Command>>> = None;
+    let mut stack = vec![CompileFrame {
+        head: None,
+        tail: None,
+        opener: None,
+    }];
 
     loop {
         line.eat_spaces();
@@ -285,7 +367,17 @@ fn compile_sequence(
         if line.eol() || line.current() == '#' {
             match lines.next_line()? {
                 None => {
-                    return Ok(head);
+                    // EOF: collapse every open frame (as recursive returns would have,
+                    // one level at a time), so an unmatched `{` still just gives back a
+                    // partial tree — `compile()`'s `parsed_block_nesting` check is what
+                    // turns that into "unmatched `{'".
+                    while stack.len() > 1 {
+                        let finished = stack.pop().unwrap();
+                        if let Some(opener) = &finished.opener {
+                            opener.borrow_mut().data = CommandData::BranchTarget(finished.head);
+                        }
+                    }
+                    return Ok(stack.pop().unwrap().head);
                 }
                 Some(line_bytes) => {
                     *line = ScriptCharProvider::new(line_bytes);
@@ -310,19 +402,34 @@ fn compile_sequence(
                 cmd_mut.code = line.current();
                 (cmd_spec.handler)(lines, line, &mut cmd_mut, context)?;
             }
-            CommandHandling::Return => return Ok(head),
+            CommandHandling::Return => {
+                // `}`: close the innermost frame and resume filling its parent. The `}`
+                // command itself is never linked into any list (it carries no data).
+                drop(cmd_mut);
+                let finished = stack.pop().ok_or_else(|| {
+                    compilation_error::<()>(lines, line, "unexpected `}'").unwrap_err()
+                })?;
+                if let Some(opener) = &finished.opener {
+                    opener.borrow_mut().data = CommandData::BranchTarget(finished.head);
+                }
+                continue;
+            }
             CommandHandling::Continue => (),
         }
+        let opens_block = cmd_mut.code == '{';
         drop(cmd_mut);
 
-        if let Some(ref t) = tail {
-            // there's already a tail: link it
-            t.borrow_mut().next = Some(cmd.clone());
-        } else {
-            // first element: set head
-            head = Some(cmd.clone());
+        stack.last_mut().unwrap().link(cmd.clone());
+        if opens_block {
+            // `{`: everything up to the matching `}` belongs to a new, inner frame;
+            // `cmd`'s `BranchTarget` is filled in (replacing the `None` placeholder
+            // `compile_block_command` left) when that frame closes above.
+            stack.push(CompileFrame {
+                head: None,
+                tail: None,
+                opener: Some(cmd),
+            });
         }
-        tail = Some(cmd);
     }
 }
 
@@ -349,19 +456,31 @@ fn compile_address_range(
         let addr1 = compile_address(lines, line, context)?;
         is_line0 = matches!(addr1, Address::Line(0));
         cmd.addr1 = Some(addr1);
-        if is_line0 && context.posix {
-            // 0 starting address is a GNU extension.
-            return compilation_error(lines, line, "address 0 is invalid in POSIX mode");
-        }
+        // A 0 starting address (valid only as `0,/regexp/`, a GNU extension letting the regexp
+        // match on line 1 too) is checked once the whole address construct has been parsed, not
+        // here — GNU doesn't fail the instant it sees the `0`, it waits to see what follows
+        // (`compile_address_range`'s two `ERR_ADDRESS_0_USAGE` sites below), --posix included:
+        // verified against the oracle, `sed --posix '0,/foo/p'` fails at char 8 (right after the
+        // full `0,/foo/`), not char 2 (right after the `0`).
         n_addr += 1;
     }
 
+    // `~` as the separator itself (`N~step`, GNU's "every step'th line starting at N") only
+    // follows a *numeric* first address, and only outside --posix (where `~` isn't recognized
+    // as address syntax at all, falling through to read as the next command instead) — verified
+    // against the oracle: `$~2p` -> "unknown command: `~'" (not a step, since `$` isn't
+    // numeric), and `--posix 3~2p` -> the same "unknown command: `~'" (not the fork's own
+    // former, invented "~step is invalid in POSIX mode").
+    let tilde_step_eligible = !context.posix && matches!(cmd.addr1, Some(Address::Line(_)));
+    let tilde_starts_step = tilde_step_eligible && !line.eol() && line.current() == '~';
+
     line.eat_spaces();
-    if n_addr == 1 && !line.eol() && matches!(line.current(), ',' | '~') {
-        let is_step_match = line.current() == '~'; // E.g. 0~2: Pick even-numbered lines
+    if n_addr == 1 && !line.eol() && (line.current() == ',' || tilde_starts_step) {
+        let separator = line.current();
+        let is_step_match = separator == '~'; // E.g. 0~2: Pick even-numbered lines
         line.advance();
         line.eat_spaces();
-        let is_step_end = if line.current() == '~' {
+        let is_step_end = if !line.eol() && line.current() == '~' {
             // E.g. /foo/,~10: Start at foo, include all lines until multiple of 10 is reached.
             line.advance();
             line.eat_spaces();
@@ -370,13 +489,23 @@ fn compile_address_range(
             false
         };
 
-        if (is_step_match || is_step_end) && context.posix {
+        if is_step_end && context.posix {
             // ~ steps are a GNU extension.
             return compilation_error(lines, line, "~step is invalid in POSIX mode");
         }
 
         // Look for second address.
         if !line.eol() {
+            // Same as `is_address_char`, plus `+`: `compile_address` accepts a leading `+`
+            // for a *second* address (`/re/,+N`) that `is_address_char` doesn't need to know
+            // about, since a first address can't start with one.
+            if !is_address_char(line.current()) && line.current() != '+' {
+                // GNU's own wording, verified against the oracle (`1,d` -> "unexpected `,'",
+                // pointing at the separator that promised a second address, not whatever
+                // invalid character follows it) — this used to reach `compile_address`'s own
+                // catch-all `_ => panic!("invalid context address")` and crash instead.
+                return compilation_error(lines, line, format!("unexpected `{separator}'"));
+            }
             let addr2 = compile_address(lines, line, context)?;
             // Set step_n to the number specified in the (required numeric) address.
             let step_n = if is_step_match || is_step_end {
@@ -394,7 +523,16 @@ fn compile_address_range(
                 0 // dummy, not used
             };
 
-            if is_line0 && !matches!(addr2, Address::Re(_)) && !is_step_match {
+            // `0~N` for a real step `N` is a legitimate GNU extension (every Nth line, as if
+            // counting from a line 0), but `0~0` names no step at all and is address-0 misuse
+            // just like `0,/re/` under --posix — verified against the oracle: `0~0p` ->
+            // "invalid usage of line address 0" at char 4 (right after `0~0`), status 1, while
+            // `0~2p` runs and matches every even line as usual.
+            if is_line0
+                && (context.posix
+                    || (!matches!(addr2, Address::Re(_)) && !is_step_match)
+                    || (is_step_match && step_n == 0))
+            {
                 return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
             }
 
@@ -415,7 +553,7 @@ fn compile_address_range(
         // After retrieval of first address, subsequent spaces
         // are consumed unconditionally. By now, the position
         // must be in non-whitespace character or EOL.
-        if line.eol() || line.current() != 'r' {
+        if context.posix || line.eol() || line.current() != 'r' {
             return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
         }
     }
@@ -436,7 +574,7 @@ fn read_file_path(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> 
     }
 
     if path.is_empty() {
-        compilation_error(lines, line, "missing file path")
+        compilation_error(lines, line, "missing filename in r/R/w/W commands")
     } else {
         os_string_from_bytes(path).map(PathBuf::from).map_err(|e| {
             compilation_error::<PathBuf>(lines, line, format!("invalid characters file path: {e}"))
@@ -454,6 +592,7 @@ fn compile_address(
     context: &ProcessingContext,
 ) -> UResult<Address> {
     let mut icase = false;
+    let mut multiline = false;
 
     if line.eol() {
         return compilation_error(lines, line, "expected context address");
@@ -471,18 +610,36 @@ fn compile_address(
             } else {
                 RegexMode::Basic
             };
-            let re = parse_regex_for_mode(lines, line, regex_mode, context.character_mode)?;
+            let re = remap_unterminated(
+                parse_regex_for_mode(
+                    lines,
+                    line,
+                    regex_mode,
+                    context.character_mode,
+                    context.posix,
+                ),
+                "unterminated address regex",
+            )?;
             // Skip over delimiter
             line.advance();
 
             line.eat_spaces();
-            if !line.eol() && line.current() == 'I' {
-                icase = true;
+            // `I`/`M` may each follow an address regex (case-insensitive / multiline), the same
+            // pair `s///` accepts as substitution flags, stackable in either order — verified
+            // against the oracle (`/re/M` reaches the same "missing command" a bare `/re/`
+            // followed by nothing does, meaning GNU recognizes `M` here as a flag, not a
+            // dangling attempt at the next command).
+            while !line.eol() && matches!(line.current(), 'I' | 'M') {
+                match line.current() {
+                    'I' => icase = true,
+                    'M' => multiline = true,
+                    _ => unreachable!(),
+                }
                 line.advance();
             }
 
             Ok(Address::Re(compile_regex(
-                lines, line, &re, context, icase, false,
+                lines, line, &re, context, icase, multiline,
             )?))
         }
         '$' => {
@@ -532,11 +689,7 @@ fn parse_number(
 }
 
 /// Parse the end of a command, failing with an error on extra characters.
-fn parse_command_ending(
-    lines: &ScriptLineProvider,
-    line: &mut ScriptCharProvider,
-    cmd: &mut Command,
-) -> UResult<()> {
+fn parse_command_ending(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> UResult<()> {
     if !line.eol() && line.current() == ';' {
         line.advance();
         return Ok(());
@@ -547,11 +700,10 @@ fn parse_command_ending(
     }
 
     if !line.eol() {
-        return compilation_error(
-            lines,
-            line,
-            format!("extra characters at the end of the {} command", cmd.code),
-        );
+        // GNU's own wording is command-agnostic — the same "extra characters after command"
+        // whichever command it was, not "...the end of the X command" — verified against the
+        // oracle for '=', 'p' and ':'.
+        return compilation_error(lines, line, "extra characters after command");
     }
 
     Ok(())
@@ -661,6 +813,24 @@ fn bre_to_ere(pattern: &[u8]) -> Vec<u8> {
 /// Compile the provided regular expression string into a corresponding engine.
 /// An empty pattern results in None, which means that the last RE employed
 /// at runtime will be used.
+/// Replace every occurrence of `from` in `bytes` with `to` (a simple byte-substring replace,
+/// not a regex) — used to widen `[:alpha:]` to a Unicode-aware class under a UTF-8 locale (see
+/// `compile_regex`), where the pattern is a `Vec<u8>`, not a `String`.
+fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn compile_regex(
     lines: &ScriptLineProvider,
     line: &ScriptCharProvider,
@@ -679,6 +849,18 @@ fn compile_regex(
         pattern.to_vec()
     } else {
         bre_to_ere(pattern)
+    };
+
+    // `[:alpha:]` (POSIX bracket class) stays ASCII-only no matter what — a hard limitation of
+    // the `regex` crate's own POSIX classes, verified with a standalone probe
+    // (`regex::bytes::RegexBuilder::new("[[:alpha:]]*").unicode(true)` still won't match "é").
+    // GNU's own `[:alpha:]` is locale-aware, so under a UTF-8 locale this widens it to match any
+    // Unicode letter instead, the same way `\w` already does under `unicode(true)`. Under the
+    // byte/C locale it's left alone, since GNU's own `[:alpha:]` there is ASCII-only too.
+    let pattern = if context.character_mode == CharacterMode::Byte {
+        pattern
+    } else {
+        replace_bytes(&pattern, b"[:alpha:]", br"\p{Alphabetic}")
     };
 
     // Add any required modifiers.
@@ -729,7 +911,11 @@ pub fn compile_replacement(
     loop {
         while !line.eol() {
             match line.current() {
-                '\\' => {
+                // Same reasoning as the pattern-side parsers: when `\` is itself the delimiter,
+                // it closes the replacement (the `c if c == delimiter` arm below) rather than
+                // starting an escape — verified against the oracle (`s\foo\bar\` closes cleanly
+                // on the replacement's own trailing `\`, the same as the pattern's).
+                '\\' if delimiter != '\\' => {
                     line.advance();
 
                     // Line input_action
@@ -739,11 +925,7 @@ pub fn compile_replacement(
                             *line = ScriptCharProvider::new(next_line);
                             continue;
                         }
-                        return compilation_error(
-                            lines,
-                            line,
-                            "unterminated substitute replacement (unexpected EOF)",
-                        );
+                        return compilation_error(lines, line, "unterminated `s' command");
                     }
 
                     match line.current() {
@@ -792,7 +974,7 @@ pub fn compile_replacement(
                         // other escape sequences
                         _ => {
                             if let Some(decoded) = parse_char_escape(line) {
-                                push_script_char(&mut literal, decoded, character_mode);
+                                push_escaped_char(&mut literal, decoded, character_mode);
                             } else {
                                 literal.push(b'\\');
                                 literal.push(line.current_byte());
@@ -837,7 +1019,7 @@ pub fn compile_replacement(
         if let Some(next_line) = lines.next_line()? {
             *line = ScriptCharProvider::new(next_line);
         } else {
-            return compilation_error(lines, line, "unterminated substitute replacement");
+            return compilation_error(lines, line, "unterminated `s' command");
         }
     }
 }
@@ -851,21 +1033,35 @@ fn compile_subst_command(
 ) -> UResult<CommandHandling> {
     line.advance(); // move past 's'
 
-    let delimiter = line.current();
-    if delimiter == '\0' || delimiter == '\\' {
-        return compilation_error(
-            lines,
-            line,
-            "substitute pattern cannot be delimited by newline or backslash",
-        );
+    // `s` with nothing after it (not even a delimiter) — GNU's own wording, verified against
+    // the oracle. Used to reach `line.current()` right below with nothing left to look at and
+    // panic (index out of bounds) instead.
+    if line.eol() {
+        return compilation_error(lines, line, "unterminated `s' command");
     }
+
+    // GNU accepts a backslash as the delimiter (`s\a\b\`) — verified against the oracle, which
+    // ran it with no error at all. A literal embedded NUL byte can't actually reach here in
+    // practice (argv strings are NUL-terminated by the OS itself), so there is no real "can't be
+    // delimited by X" case left to reject up front; whatever GNU would reject, it rejects
+    // downstream through the normal parse — e.g. an actually-unterminated command still reports
+    // `unterminated `s' command` on its own, just like any other delimiter would.
 
     let regex_mode = if context.regex_extended {
         RegexMode::Extended
     } else {
         RegexMode::Basic
     };
-    let pattern = parse_regex_for_mode(lines, line, regex_mode, context.character_mode)?;
+    let pattern = remap_unterminated(
+        parse_regex_for_mode(
+            lines,
+            line,
+            regex_mode,
+            context.character_mode,
+            context.posix,
+        ),
+        "unterminated `s' command",
+    )?;
     let mut subst = Box::new(Substitution::default());
 
     subst.replacement = compile_replacement(lines, line, context.character_mode)?;
@@ -907,7 +1103,7 @@ fn compile_subst_command(
     }
     cmd.data = CommandData::Substitution(subst);
 
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -920,17 +1116,25 @@ fn compile_trans_command(
 ) -> UResult<CommandHandling> {
     line.advance(); // move past 'y'
 
-    let delimiter = line.current();
-    if delimiter == '\0' || delimiter == '\\' {
-        return compilation_error(
-            lines,
-            line,
-            "transliteration string cannot be delimited by newline or backslash",
-        );
+    // `y` with nothing after it (not even a delimiter) — mirrors the same guard
+    // `compile_subst_command` has for a bare `s`, and GNU's own wording for it, verified against
+    // the oracle. Used to reach `line.current()` right below with nothing left to look at and
+    // panic (index out of bounds) instead.
+    if line.eol() {
+        return compilation_error(lines, line, "unterminated `y' command");
     }
 
-    let source = parse_transliteration_for_mode(lines, line, context.character_mode)?;
-    let target = parse_transliteration_for_mode(lines, line, context.character_mode)?;
+    // GNU accepts a backslash as the delimiter (`y\a\b\`) — verified against the oracle, which
+    // ran it with no error at all, the same as for `s` above.
+
+    let source = remap_unterminated(
+        parse_transliteration_for_mode(lines, line, context.character_mode),
+        "unterminated `y' command",
+    )?;
+    let target = remap_unterminated(
+        parse_transliteration_for_mode(lines, line, context.character_mode),
+        "unterminated `y' command",
+    )?;
     let transliteration = match (source, target) {
         (ParsedTransliteration::Bytes(source), ParsedTransliteration::Bytes(target)) => {
             if source.len() != target.len() {
@@ -949,7 +1153,7 @@ fn compile_trans_command(
     cmd.data = CommandData::Transliteration(transliteration);
 
     line.advance(); // move past last delimiter
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -983,11 +1187,7 @@ pub fn compile_subst_flags(
         match line.current() {
             'g' => {
                 if seen_g {
-                    return compilation_error(
-                        lines,
-                        line,
-                        "multiple 'g' or numeric flags in substitute command",
-                    );
+                    return compilation_error(lines, line, "multiple `g' options to `s' command");
                 }
                 seen_g = true;
                 line.advance();
@@ -1016,40 +1216,48 @@ pub fn compile_subst_flags(
                 line.advance();
             }
 
+            // GNU's own two messages here are not one shared "not allowed with --posix or
+            // --sandbox" text — verified against the oracle: `--posix s/a/b/e` gives the plain
+            // `` unknown option to `s' `` any unrecognized flag gets (posix simply doesn't know
+            // the `e` flag exists, no special-cased refusal), while `--sandbox s/a/b/e` gives
+            // the dedicated sandbox message.
+            'e' if posix => {
+                return compilation_error(lines, line, ERR_UNKNOWN_OPTION_TO_S);
+            }
             'e' => {
-                if posix || sandbox {
-                    return compilation_error(
-                        lines,
-                        line,
-                        "the 'e' substitute flag is not allowed with --posix or --sandbox",
-                    );
+                if sandbox {
+                    return compilation_error(lines, line, ERR_SANDBOX);
                 }
                 subst.execute = true;
                 line.advance();
             }
 
+            // GNU's own wording, verified against the oracle: `s/a/b/0` -> "number option to
+            // `s' command may not be zero", not the generic "unknown option to `s'" a leading
+            // '0' fell into before (it can't be the start of a valid occurrence number the
+            // '1'..='9' arm below would ever see, since that arm only matches a nonzero digit).
+            '0' => {
+                return compilation_error(
+                    lines,
+                    line,
+                    "number option to `s' command may not be zero",
+                );
+            }
+
             _c @ '1'..='9' => {
                 if seen_n {
-                    return compilation_error(
-                        lines,
-                        line,
-                        "multiple 'g' or numeric flags in substitute command",
-                    );
+                    return compilation_error(lines, line, "multiple `g' options to `s' command");
                 }
 
                 let mut number = 0usize;
                 while !line.eol() && line.current().is_ascii_digit() {
+                    // GNU accepts an occurrence number past usize::MAX with no error at all —
+                    // verified against the oracle (`s/a/b/999999999999999999999`, 21 digits,
+                    // succeeds) — so this saturates instead of refusing, the same as GNU's own
+                    // unsigned-long overflow silently clamping.
                     number = number
-                        .checked_mul(10)
-                        .and_then(|n| n.checked_add(line.current().to_digit(10).unwrap() as usize))
-                        .ok_or_else(|| {
-                            compilation_error::<()>(
-                                lines,
-                                line,
-                                "overflow in numeric substitute flag",
-                            )
-                            .unwrap_err()
-                        })?;
+                        .saturating_mul(10)
+                        .saturating_add(line.current().to_digit(10).unwrap() as usize);
                     line.advance();
                 }
 
@@ -1069,12 +1277,8 @@ pub fn compile_subst_flags(
 
             ';' | '\n' => break,
 
-            other => {
-                return compilation_error(
-                    lines,
-                    line,
-                    format!("invalid substitute flag: '{other}'"),
-                );
+            _ => {
+                return compilation_error(lines, line, ERR_UNKNOWN_OPTION_TO_S.to_string());
             }
         }
     }
@@ -1093,7 +1297,7 @@ pub fn compile_subst_flags(
 fn compile_end_group_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
-    cmd: &mut Command,
+    _cmd: &mut Command,
     context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
     if context.parsed_block_nesting == 0 {
@@ -1102,7 +1306,7 @@ fn compile_end_group_command(
     context.parsed_block_nesting -= 1;
     line.advance();
     line.eat_spaces();
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Return)
 }
 
@@ -1113,11 +1317,13 @@ fn compile_negation_command(
     cmd: &mut Command,
     _context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
+    // GNU reports a second `!` at its own position (char 5 in `1,2!!p`), not after skipping
+    // past it (char 6, where this used to check) — verified against the oracle.
+    if cmd.non_select {
+        return compilation_error(lines, line, "multiple `!'s");
+    }
     line.advance();
     line.eat_spaces();
-    if cmd.non_select {
-        return compilation_error(lines, line, "negation already applied");
-    }
     cmd.non_select = true;
     Ok(CommandHandling::GetNext)
 }
@@ -1127,13 +1333,13 @@ fn compile_negation_command(
 fn compile_empty_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
-    cmd: &mut Command,
+    _cmd: &mut Command,
     _context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
     line.advance(); // Skip the command character
     line.eat_spaces(); // Skip any trailing whitespace
 
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1148,6 +1354,16 @@ fn compile_read_file_command(
         return compilation_error(lines, line, ERR_SANDBOX);
     }
     let path = read_file_path(lines, line)?;
+    // Unlike `w`/`R`, which open their file right away, `r`'s file is only read when the
+    // command runs — possibly long after compilation, and (for an embedder) possibly
+    // against a process working directory that no longer matches whatever was current
+    // when this script was compiled. Make the path absolute now, against the directory
+    // that is current right now, so a later read isn't at the mercy of that.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(&path))
+    };
     cmd.data = CommandData::Path(path);
     Ok(CommandHandling::Continue)
 }
@@ -1168,7 +1384,29 @@ fn compile_write_file_command(
     Ok(CommandHandling::Continue)
 }
 
+// Handles R (GNU): like 'r', but queues one line from `path` per invocation instead of
+// the whole file. A missing or unreadable file behaves as empty, never an error.
+fn compile_read_line_command(
+    lines: &mut ScriptLineProvider,
+    line: &mut ScriptCharProvider,
+    cmd: &mut Command,
+    context: &mut ProcessingContext,
+) -> UResult<CommandHandling> {
+    if context.sandbox {
+        return compilation_error(lines, line, ERR_SANDBOX);
+    }
+    let path = read_file_path(lines, line)?;
+    cmd.data = CommandData::NamedReader(Rc::new(RefCell::new(NamedReader::new(path))));
+    Ok(CommandHandling::Continue)
+}
+
 // Handles {
+// `compile_sequence` special-cases `{` itself (it must push a new frame onto its own
+// frame stack rather than recurse), so this handler only does the two things that must
+// happen exactly where `{` is consumed: skip past it and count the nesting for
+// `compile_end_group_command`'s "unexpected `}'" check. `cmd.data` is filled in once the
+// matching `}` (or EOF) closes the frame; `compile_sequence` leaves it as `BranchTarget
+// (None)` (an empty block) until then.
 fn compile_block_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
@@ -1177,8 +1415,10 @@ fn compile_block_command(
 ) -> UResult<CommandHandling> {
     line.advance(); // move past '{'
     context.parsed_block_nesting += 1;
-    let block_body = compile_sequence(lines, line, context)?;
-    cmd.data = CommandData::BranchTarget(block_body);
+    if context.parsed_block_nesting > MAX_BLOCK_NESTING {
+        return compilation_error(lines, line, ERR_BLOCK_NESTING_TOO_DEEP);
+    }
+    cmd.data = CommandData::BranchTarget(None);
     Ok(CommandHandling::Continue)
 }
 
@@ -1214,17 +1454,8 @@ fn compile_label_command(
     }
 
     line.eat_spaces(); // Skip any trailing whitespace
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
-}
-
-/// Return the width of the command's terminal or a default.
-fn output_width() -> usize {
-    if let Some((Width(w), _)) = terminal_size() {
-        w as usize
-    } else {
-        DEFAULT_OUTPUT_WIDTH
-    }
 }
 
 /// Compile commands that take a number as an argument.
@@ -1233,7 +1464,7 @@ fn compile_number_command(
     lines: &mut ScriptLineProvider,
     line: &mut ScriptCharProvider,
     cmd: &mut Command,
-    _context: &mut ProcessingContext,
+    context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
     line.advance(); // Skip the command character
     line.eat_spaces(); // Skip any leading whitespace
@@ -1247,14 +1478,17 @@ fn compile_number_command(
                 cmd.data = CommandData::Number(0);
             }
             'l' => {
-                cmd.data = CommandData::Number(output_width());
+                // A bare `l` wraps at the `-l N` length (default 70), never at the
+                // controlling terminal's width: GNU sed's line-wrap length is not
+                // terminal-dependent.
+                cmd.data = CommandData::Number(context.length);
             }
             _ => panic!("invalid number-expecting command"),
         },
     }
 
     line.eat_spaces(); // Skip any trailing whitespace
-    parse_command_ending(lines, line, cmd)?;
+    parse_command_ending(lines, line)?;
     Ok(CommandHandling::Continue)
 }
 
@@ -1293,11 +1527,7 @@ fn compile_text_command_gnu(
     let mut escaped_newline = false;
 
     if line.eol() {
-        return compilation_error(
-            lines,
-            line,
-            format!("command `{}' expects \\ followed by text", cmd.code),
-        );
+        return compilation_error(lines, line, "expected \\ after `a', `c' or `i'".to_string());
     }
 
     // Skip optional \.
@@ -1337,7 +1567,7 @@ fn compile_text_command_gnu(
             }
 
             if let Some(decoded) = parse_char_escape(line) {
-                push_script_char(&mut text, decoded, context.character_mode);
+                push_escaped_char(&mut text, decoded, context.character_mode);
             } else {
                 // Invalid escapes result in the escaped character.
                 text.push(line.current_byte());
@@ -1362,11 +1592,7 @@ fn compile_text_command_posix(
     _context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
     if line.eol() || line.current() != '\\' {
-        return compilation_error(
-            lines,
-            line,
-            format!("command `{}' expects \\ followed by text", cmd.code),
-        );
+        return compilation_error(lines, line, "expected \\ after `a', `c' or `i'".to_string());
     }
 
     line.advance(); // Skip \.
@@ -1424,7 +1650,8 @@ fn compile_version_command(
 
     let mut ver_semantic = 0;
 
-    while !line.eol() {
+    // Like a label, the version ends at whitespace or `;`, so `v 4.2;p` runs `p`.
+    while !line.eol() && !line.current().is_whitespace() && line.current() != ';' {
         if line.current() == '.' {
             ver_semantic += 1;
             line.advance();
@@ -1456,7 +1683,8 @@ fn compile_version_command(
         Ok(major_int) => match minor.parse::<u8>() {
             Ok(minor_int) => match patch.parse::<u8>() {
                 Ok(patch_int) => {
-                    if minor_int <= GNU_MINOR && major_int <= GNU_MAJOR && patch_int == GNU_PATCH {
+                    // Version order, as GNU's strverscmp gives: 3.99 is older than 4.9.
+                    if (major_int, minor_int, patch_int) <= (GNU_MAJOR, GNU_MINOR, GNU_PATCH) {
                         return Ok(CommandHandling::Continue);
                     }
                     compilation_error(lines, line, "expected newer version of sed")
@@ -1480,12 +1708,11 @@ fn compile_execute_command(
     cmd: &mut Command,
     context: &mut ProcessingContext,
 ) -> UResult<CommandHandling> {
-    if context.posix || context.sandbox {
-        return compilation_error(
-            lines,
-            line,
-            "the 'e' command is not allowed with --posix or --sandbox",
-        );
+    // --posix already keeps this function from ever being reached (get_cmd_spec's 'e' entry is
+    // `if !posix`, so an --posix script reports "unknown command" instead); only --sandbox is
+    // checked here, with GNU's own dedicated sandbox wording.
+    if context.sandbox {
+        return compilation_error(lines, line, ERR_SANDBOX);
     }
     if context.no_exec {
         return compilation_error(lines, line, ERR_NO_EXEC);
@@ -1548,7 +1775,7 @@ fn compile_execute_command(
             }
 
             if let Some(decoded) = parse_char_escape(line) {
-                push_script_char(&mut text, decoded, context.character_mode);
+                push_escaped_char(&mut text, decoded, context.character_mode);
             } else {
                 // Invalid escapes result in the escaped character.
                 text.push(line.current_byte());
@@ -1579,13 +1806,23 @@ fn get_verified_cmd_spec(
     posix: bool,
 ) -> UResult<CommandSpec> {
     if line.eol() {
-        return compilation_error(lines, line, "command expected");
+        // GNU's own wording, verified against the oracle (`sed '1'`, `sed '1~'`, `sed '/re/I'`
+        // all reach this exact message, not this fork's earlier, unverified "command expected").
+        return compilation_error(lines, line, "missing command");
     }
 
     let ch = line.current();
     let cmd_spec = get_cmd_spec(lines, line, ch, posix)?;
 
     if n_addr > cmd_spec.n_addr {
+        // GNU's own wording for the one-address case is command-agnostic — "command only uses
+        // one address", not "command X expects up to N address(es), found M" — verified against
+        // the oracle for q, Q, and i/a/= under --posix (where their own n_addr also drops to 1).
+        // Commands with a different limit (0) haven't been checked against the oracle, so they
+        // keep the fork's own generic wording.
+        if cmd_spec.n_addr == 1 {
+            return compilation_error(lines, line, "command only uses one address");
+        }
         return compilation_error(
             lines,
             line,
@@ -1647,12 +1884,24 @@ fn get_cmd_spec(
             n_addr: 2,
             handler: compile_empty_command,
         }),
+        // L (an obsolete GNU line-wrapping command) is still recognized by GNU's own compiler
+        // — refusing it as "unknown command" would be wrong — but its execution was removed
+        // long ago, so *running* it (not just compiling it) fails with GNU's own internal-error
+        // message (see the 'L' runtime arm) — verified against the oracle for compiling with
+        // one or two addresses and for --posix, where it isn't recognized at all.
+        'L' if !posix => Ok(CommandSpec {
+            n_addr: 2,
+            handler: compile_empty_command,
+        }),
         'l' => Ok(CommandSpec {
             n_addr: 2,
             handler: compile_number_command,
         }),
+        // GNU restricts q to one address in every mode, not just --posix — verified against the
+        // oracle (`sed '1,2q'` fails the same way with or without --posix, unlike a/i/c/=, whose
+        // second address really is a GNU-only extension).
         'q' => Ok(CommandSpec {
-            n_addr: if posix { 1 } else { 2 },
+            n_addr: 1,
             handler: compile_number_command,
         }),
         // Q is a GNU extension
@@ -1660,8 +1909,12 @@ fn get_cmd_spec(
             n_addr: 1,
             handler: compile_number_command,
         }),
-        // e is a GNU extension
-        'e' => Ok(CommandSpec {
+        // e is a GNU extension, and --posix disables it the same way it disables every other
+        // GNU-only command: it simply isn't recognized — verified against the oracle
+        // (`--posix '1e echo hi'` -> `` unknown command: `e' ``, not a dedicated "not allowed
+        // with --posix" refusal, which is reserved for --sandbox, still checked inside
+        // `compile_execute_command`).
+        'e' if !posix => Ok(CommandSpec {
             n_addr: 2,
             handler: compile_execute_command,
         }),
@@ -1672,6 +1925,10 @@ fn get_cmd_spec(
         'r' => Ok(CommandSpec {
             n_addr: if posix { 1 } else { 2 },
             handler: compile_read_file_command,
+        }),
+        'R' if !posix => Ok(CommandSpec {
+            n_addr: 2,
+            handler: compile_read_line_command,
         }),
         's' => Ok(CommandSpec {
             n_addr: 2,
@@ -1697,7 +1954,7 @@ fn get_cmd_spec(
             n_addr: 0,
             handler: compile_version_command,
         }),
-        _ => compilation_error(lines, line, format!("invalid command code `{cmd_code}'")),
+        _ => compilation_error(lines, line, format!("unknown command: `{cmd_code}'")),
     }
 }
 
@@ -1715,7 +1972,7 @@ mod tests {
     fn make_line_provider(lines: &[&str]) -> ScriptLineProvider {
         let input = lines
             .iter()
-            .map(|s| ScriptValue::StringVal((*s).to_string()))
+            .map(|s| ScriptValue::StringVal((*s).as_bytes().to_vec()))
             .collect();
         ScriptLineProvider::new(input)
     }
@@ -1768,16 +2025,9 @@ mod tests {
     #[test]
     fn test_parse_command_ending_rejects_extra_characters() {
         let (lines, mut chars) = make_providers("extra");
-        let mut cmd = Command {
-            code: 'p',
-            ..Default::default()
-        };
 
-        let err = parse_command_ending(&lines, &mut chars, &mut cmd).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("extra characters at the end of the p command")
-        );
+        let err = parse_command_ending(&lines, &mut chars).unwrap_err();
+        assert!(err.to_string().contains("extra characters after command"));
     }
 
     #[test]
@@ -1842,7 +2092,7 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("test.sed:1:1: error: command expected"));
+        assert!(msg.contains("test.sed:1:0: error: missing command"));
     }
 
     #[test]
@@ -1853,7 +2103,7 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("script.sed:2:1: error: invalid command code `@'"));
+        assert!(msg.contains("script.sed:2:1: error: unknown command: `@'"));
     }
 
     #[test]
@@ -1864,9 +2114,7 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("input.sed:3:1: error: command q expects up to 1 address(es), found 2")
-        );
+        assert!(msg.contains("input.sed:3:1: error: command only uses one address"));
     }
 
     #[test]
@@ -1886,9 +2134,7 @@ mod tests {
         let result = get_verified_cmd_spec(&lines, &line, 2, true);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("input.sed:1:1: error: command i expects up to 1 address(es), found 2")
-        );
+        assert!(msg.contains("input.sed:1:1: error: command only uses one address"));
     }
 
     // parse_number
@@ -1965,6 +2211,32 @@ mod tests {
         let (lines, chars) = dummy_providers();
         let result = compile_regex(&lines, &chars, "a[d", &ctx(), false, false);
         assert!(result.is_err()); // Should fail due to open bracketed expression
+    }
+
+    #[test]
+    fn test_alpha_class_matches_unicode_letters_under_utf8() {
+        // `[:alpha:]` is locale-aware in GNU sed; under a UTF-8 locale (`ctx()`'s default) it
+        // should match a non-ASCII letter, not just A-Za-z — verified against the oracle
+        // (`sed 's/[[:alpha:]]/A/g'` on "héllo wörld" -> "AAAAA AAAAA").
+        let (lines, chars) = dummy_providers();
+        let regex = compile_regex(&lines, &chars, "[[:alpha:]]", &ctx(), false, false)
+            .unwrap()
+            .expect("regex should be present");
+        assert!(regex.is_match(&mut IOChunk::new_from_str("é")).unwrap());
+        assert!(regex.is_match(&mut IOChunk::new_from_str("ö")).unwrap());
+    }
+
+    #[test]
+    fn test_alpha_class_stays_ascii_only_under_byte_mode() {
+        // The counterpart to the above: under the byte/C locale, GNU's own `[:alpha:]` is
+        // ASCII-only too, so this widening must not apply there.
+        let (lines, chars) = dummy_providers();
+        let mut byte_ctx = ctx();
+        byte_ctx.character_mode = CharacterMode::Byte;
+        let regex = compile_regex(&lines, &chars, "[[:alpha:]]", &byte_ctx, false, false)
+            .unwrap()
+            .expect("regex should be present");
+        assert!(regex.is_match(&mut IOChunk::new_from_str("a")).unwrap());
     }
 
     #[test]
@@ -2225,7 +2497,7 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("unterminated regular expression"));
+        assert!(msg.contains("unterminated address regex"));
     }
 
     // compile_sequence
@@ -2363,7 +2635,7 @@ mod tests {
     // compile
     #[test]
     fn test_compile_single_command() {
-        let scripts = vec![ScriptValue::StringVal("1q".to_string())];
+        let scripts = vec![ScriptValue::StringVal(b"1q".to_vec())];
         let mut opts = ProcessingContext::default();
 
         let result = compile(scripts, &mut opts).unwrap();
@@ -2383,7 +2655,7 @@ mod tests {
 
     #[test]
     fn test_compile_two_commands() {
-        let scripts = vec![ScriptValue::StringVal("l;q".to_string())];
+        let scripts = vec![ScriptValue::StringVal(b"l;q".to_vec())];
         let mut opts = ProcessingContext::default();
 
         let result = compile(scripts, &mut opts).unwrap();
@@ -2503,21 +2775,20 @@ mod tests {
 
     #[test]
     fn test_compile_replacement_escape_utf8_mode() {
+        // GNU inserts the literal byte a `\xHH` escape produces, never a UTF-8 encoding of it,
+        // regardless of character mode: same expectation as `..._byte_mode` above.
         let (mut lines, mut chars) = make_providers("/\\xE9/");
         let template = compile_replacement(&mut lines, &mut chars, CharacterMode::Utf8).unwrap();
 
         assert_eq!(template.parts.len(), 1);
-        assert!(matches!(
-            &template.parts[0],
-            ReplacementPart::Literal(s) if s == "é".as_bytes()
-        ));
+        assert!(matches!(&template.parts[0], ReplacementPart::Literal(s) if s == b"\xE9"));
     }
 
     #[test]
     fn test_compile_replacement_line_continuation() {
         let script = vec![
-            ScriptValue::StringVal("/first line\\".to_string()),
-            ScriptValue::StringVal(" continued/".to_string()),
+            ScriptValue::StringVal(b"/first line\\".to_vec()),
+            ScriptValue::StringVal(b" continued/".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(script);
         let first_line = provider.next_line().unwrap().unwrap();
@@ -2556,10 +2827,7 @@ mod tests {
         let (mut lines, mut chars) = make_providers(r"/abc\");
         let err = compile_replacement_utf8(&mut lines, &mut chars).unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("unterminated substitute replacement (unexpected EOF)")
-        );
+        assert!(err.to_string().contains("unterminated `s' command"));
     }
 
     #[test]
@@ -2578,10 +2846,7 @@ mod tests {
         let (mut lines, mut chars) = make_providers("/abc");
         let err = compile_replacement_utf8(&mut lines, &mut chars).unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("unterminated substitute replacement")
-        );
+        assert!(err.to_string().contains("unterminated `s' command"));
     }
 
     // compile_subst_flags
@@ -2672,7 +2937,7 @@ mod tests {
                 compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("multiple 'g' or numeric flags in substitute command")
+                    .contains("multiple `g' options to `s' command")
             );
         }
     }
@@ -2683,7 +2948,10 @@ mod tests {
         let mut subst = Substitution::default();
 
         let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap_err();
-        assert!(err.to_string().contains("missing file path"));
+        assert!(
+            err.to_string()
+                .contains("missing filename in r/R/w/W commands")
+        );
     }
 
     #[test]
@@ -2720,14 +2988,14 @@ mod tests {
 
     #[test]
     fn test_compile_subst_flag_e_rejected_under_posix() {
+        // GNU's own wording, verified against the oracle: --posix gives the plain "unknown
+        // option to `s'" any unrecognized flag gets, not a dedicated "not allowed" refusal —
+        // that wording is reserved for --sandbox, tested separately below.
         let (lines, mut chars) = make_providers("e");
         let mut subst = Substitution::default();
 
         let err = compile_subst_flags(&lines, &mut chars, &mut subst, true, false).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("not allowed with --posix or --sandbox")
-        );
+        assert!(err.to_string().contains("unknown option to `s'"));
     }
 
     #[test]
@@ -2738,7 +3006,7 @@ mod tests {
         let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, true).unwrap_err();
         assert!(
             err.to_string()
-                .contains("not allowed with --posix or --sandbox")
+                .contains("e/r/w commands disabled in sandbox mode")
         );
     }
 
@@ -2748,22 +3016,63 @@ mod tests {
         let mut subst = Substitution::default();
 
         let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false).unwrap_err();
-        assert!(err.to_string().contains("invalid substitute flag"));
+        assert!(err.to_string().contains("unknown option to `s'"));
     }
 
     // compile_subst_command
     #[test]
-    fn test_compile_subst_invalid_delimiter_backslash() {
+    fn test_compile_subst_backslash_delimiter_is_accepted() {
+        // GNU accepts a backslash as the `s` delimiter — verified against the oracle
+        // (`sed 's\foo\bar\'` runs with no error at all), unlike this fork's own earlier,
+        // unverified assumption that it (like a raw NUL byte, which can't reach here in
+        // practice) should be refused up front.
         let (mut lines, mut chars) = make_providers("s\\foo\\bar\\");
         let mut cmd = Command::default();
         let mut context = ctx();
 
+        let result = compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // compile_trans_command
+    #[test]
+    fn test_compile_trans_bare_y_reports_unterminated_instead_of_panicking() {
+        // A bare `y` (not even a delimiter) used to reach `line.current()` with nothing left to
+        // look at and panic (index out of bounds) — GNU's own wording, verified against the
+        // oracle (`sed 'y'` -> `` unterminated `y' command ``).
+        let (mut lines, mut chars) = make_providers("y");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
         let err =
-            compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("substitute pattern cannot be delimited")
-        );
+            compile_trans_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
+        assert!(err.to_string().contains("unterminated `y' command"));
+    }
+
+    #[test]
+    fn test_compile_trans_backslash_delimiter_is_accepted() {
+        // GNU accepts a backslash as the `y` delimiter too — verified against the oracle
+        // (`sed 'y\a\b\'` runs with no error at all).
+        let (mut lines, mut chars) = make_providers("y\\a\\b\\");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        let result = compile_trans_command(&mut lines, &mut chars, &mut cmd, &mut context);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn test_compile_trans_unterminated_reports_ys_own_wording() {
+        // `y/a` (a delimiter and a source with no closing delimiter) used to report the shared,
+        // generic "unterminated transliteration string" — GNU's own wording names the command,
+        // `` unterminated `y' command ``, verified against the oracle.
+        let (mut lines, mut chars) = make_providers("y/a");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        let err =
+            compile_trans_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
+        assert!(err.to_string().contains("unterminated `y' command"));
     }
 
     #[test]
@@ -2774,7 +3083,7 @@ mod tests {
 
         let err =
             compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
-        assert!(err.to_string().contains("invalid substitute flag"));
+        assert!(err.to_string().contains("unknown option to `s'"));
     }
 
     #[test]
@@ -3059,6 +3368,37 @@ mod tests {
         assert!(err.to_string().contains(ERR_SANDBOX));
     }
 
+    #[test]
+    // FB-021: `r`'s file is opened when the command *runs*, which for an embedder may be
+    // long after (and so against a different process directory than) when the script was
+    // compiled. Resolving to an absolute path at compile time, while the directory is
+    // still the right one, keeps the later read from landing in the wrong place.
+    fn test_compile_read_file_command_resolves_a_relative_path_to_absolute() {
+        let (mut lines, mut chars) = make_providers("r input.txt");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        compile_read_file_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
+        let CommandData::Path(path) = &cmd.data else {
+            panic!("expected CommandData::Path, got {:?}", cmd.data);
+        };
+        assert!(path.is_absolute(), "{path:?} is not absolute");
+        assert_eq!(path.file_name().unwrap(), "input.txt");
+    }
+
+    #[test]
+    fn test_compile_read_file_command_leaves_an_absolute_path_alone() {
+        let (mut lines, mut chars) = make_providers("r /already/absolute.txt");
+        let mut cmd = Command::default();
+        let mut context = ctx();
+
+        compile_read_file_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
+        let CommandData::Path(path) = &cmd.data else {
+            panic!("expected CommandData::Path, got {:?}", cmd.data);
+        };
+        assert_eq!(path, std::path::Path::new("/already/absolute.txt"));
+    }
+
     // compile_write_file_command
     #[test]
     fn test_compile_write_file_command_rejected_under_sandbox() {
@@ -3192,21 +3532,24 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_label_gives_error() {
+    fn test_duplicate_label_is_accepted_and_the_later_one_wins() {
+        // GNU doesn't refuse a duplicate label — verified against the oracle
+        // (`sed ':lbl;:lbl'` compiles and runs with no error).
         let a1 = command_with_data(CommandData::Label(Some("dup".to_string())));
         a1.borrow_mut().code = ':';
 
         let a2 = command_with_data(CommandData::Label(Some("dup".to_string())));
         a2.borrow_mut().code = ':';
+        let a2_ptr = Rc::as_ptr(&a2);
 
         let head = link_commands(vec![a1, a2]);
         let mut context = ProcessingContext::default();
 
         let result = populate_label_map(head, &mut context);
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("duplicate label `dup'"));
+        assert!(result.is_ok(), "{result:?}");
+        let mapped = context.label_to_command_map.get("dup").unwrap();
+        assert_eq!(Rc::as_ptr(mapped), a2_ptr);
     }
 
     // populate_range_commands
@@ -3343,15 +3686,20 @@ mod tests {
 
     #[test]
     fn test_branch_target_missing_label_gives_error() {
+        // GNU's own wording and status — verified against the oracle: this is a late-binding
+        // setup failure (status 4, no location prefix), not a script syntax error.
         let branch = command_with_data(CommandData::Label(Some("nope".to_string())));
         branch.borrow_mut().code = 't';
 
         let mut context = ProcessingContext::default();
         let result = resolve_branch_targets(Some(branch), &mut context);
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("undefined label `nope'"));
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), 4);
+        assert!(
+            err.to_string()
+                .contains("can't find label for jump to `nope'")
+        );
     }
 
     #[test]
@@ -3497,7 +3845,7 @@ mod tests {
         let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("expects \\ followed by text"));
+        assert!(err.contains("expected \\ after `a', `c' or `i'"));
     }
 
     #[test]
@@ -3593,7 +3941,7 @@ mod tests {
         let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("expects \\ followed by text"));
+        assert!(err.contains("expected \\ after `a', `c' or `i'"));
     }
 
     #[test]
@@ -3626,7 +3974,10 @@ mod tests {
         let (lines, mut chars) = make_providers("w ");
 
         let err = read_file_path(&lines, &mut chars).unwrap_err();
-        assert!(err.to_string().contains("missing file path"));
+        assert!(
+            err.to_string()
+                .contains("missing filename in r/R/w/W commands")
+        );
     }
 
     #[test]

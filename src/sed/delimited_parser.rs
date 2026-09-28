@@ -108,6 +108,131 @@ pub fn push_script_char(bytes: &mut Vec<u8>, ch: char, character_mode: Character
     }
 }
 
+/// The result of parsing a `\`-escape valid in all contexts (RE pattern, substitution,
+/// transliteration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapedChar {
+    /// A raw byte produced by a `\dNNN`, `\oNNN` or `\xHH` numeric escape. GNU always inserts
+    /// the literal byte value these produce, never a UTF-8 encoding of it — so, unlike
+    /// `Char`, this must bypass `character_mode`'s usual encoding and reach the output as this
+    /// exact byte (see `push_escaped_char`, `push_pattern_escaped_char` and
+    /// `push_transliteration_escaped_char`, one per context that needs a different way to keep
+    /// that byte intact through a `CharacterMode::Utf8` buffer that otherwise has to stay valid
+    /// UTF-8).
+    Byte(u8),
+    /// Any other escape's character (a named escape like `\n`, a control escape `\cX`, or this
+    /// fork's own `\uXXXX`/`\UXXXXXXXX` Unicode escapes): encoded per `character_mode` as usual.
+    Char(char),
+}
+
+/// The base of a reserved, 256-codepoint Unicode Private Use Area block sed's own parser uses
+/// to carry a numeric escape's raw byte value through a `CharacterMode::Utf8` transliteration
+/// operand, so the accumulated buffer stays valid UTF-8 (a Rust `String` cannot hold a byte like
+/// 0xFF on its own) while `Transliteration::insert` (`command.rs`) can still recover the exact
+/// byte GNU would have inserted. Real script text using this obscure PUA block for a `y///`
+/// operand character — or this fork's own `\uE0xx` escape landing in it — would collide; both
+/// are accepted, narrow limitations rather than something worth a second side channel for.
+const BYTE_MARKER_BASE: u32 = 0xE000;
+
+/// Encode `b` as this module's transliteration byte marker (see `BYTE_MARKER_BASE`).
+fn byte_marker(b: u8) -> char {
+    char::from_u32(BYTE_MARKER_BASE + u32::from(b)).expect("BYTE_MARKER_BASE + 0..=255 is valid")
+}
+
+/// Decode `c` as this module's transliteration byte marker, if it is one.
+pub(crate) fn byte_from_marker(c: char) -> Option<u8> {
+    let codepoint = c as u32;
+    (BYTE_MARKER_BASE..BYTE_MARKER_BASE + 256)
+        .contains(&codepoint)
+        .then(|| u8::try_from(codepoint - BYTE_MARKER_BASE).expect("checked to be in 0..256"))
+}
+
+/// Append an escaped character for a literal-text context (substitution replacement text, or
+/// the `a`/`c`/`i`/`e` command text): these are spliced into the output as-is, with no further
+/// validation, so a raw byte can always be pushed directly.
+pub fn push_escaped_char(bytes: &mut Vec<u8>, escaped: EscapedChar, character_mode: CharacterMode) {
+    match escaped {
+        EscapedChar::Byte(b) => bytes.push(b),
+        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
+    }
+}
+
+/// Append an escaped character for a regular-expression pattern context (the top-level RE
+/// dialect body, not a bracket expression — see `parse_character_class`'s own, more limited
+/// handling): the accumulated bytes are later re-checked as UTF-8 text before reaching the
+/// regex engine in `CharacterMode::Utf8` (`fast_regex::Regex::new`), so a raw byte above ASCII
+/// cannot be pushed directly there without breaking that check. `(?-u:\xHH)` asks the regex
+/// engine to match that exact byte at this point without requiring it (or the rest of the
+/// pattern) to decode as a Unicode scalar value — mirroring what `byte_regex_pattern` already
+/// does for the same escape in `CharacterMode::Byte`.
+///
+/// `regex_mode` matters because `RegexMode::Basic` patterns still go through `bre_to_ere`
+/// (`compiler.rs`) after this, which escapes a bare `(`, `?` or `)` here as a literal
+/// (GNU BRE's own meaning for them unescaped) rather than leaving them as the group syntax
+/// they are meant to be — so in `RegexMode::Basic` this emits the BRE-escaped spelling
+/// (`\(\?-u:\xHH\)`) that `bre_to_ere` turns back into the same unescaped group;
+/// `RegexMode::Extended` skips `bre_to_ere` entirely and gets that group directly.
+pub fn push_pattern_escaped_char(
+    bytes: &mut Vec<u8>,
+    escaped: EscapedChar,
+    character_mode: CharacterMode,
+    regex_mode: RegexMode,
+) {
+    match escaped {
+        EscapedChar::Byte(b) if character_mode == CharacterMode::Utf8 && b > 0x7F => {
+            let group = match regex_mode {
+                RegexMode::Basic => format!("\\(\\?-u:\\x{b:02X}\\)"),
+                RegexMode::Extended => format!("(?-u:\\x{b:02X})"),
+            };
+            bytes.extend_from_slice(group.as_bytes());
+        }
+        EscapedChar::Byte(b) => bytes.push(b),
+        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
+    }
+}
+
+/// Append an escaped character for a `y///` operand: like the pattern context, the accumulated
+/// bytes are later re-checked as UTF-8 text in `CharacterMode::Utf8` (`parsed_bytes_to_utf8`),
+/// but unlike a pattern there is no regex engine downstream to interpret an inline escape — a
+/// `y///` operand is matched and substituted one character for one character. So a raw byte
+/// above ASCII is instead stood in for by this module's private-use marker character, which
+/// `Transliteration::insert` (`command.rs`) decodes back to the exact byte.
+pub fn push_transliteration_escaped_char(
+    bytes: &mut Vec<u8>,
+    escaped: EscapedChar,
+    character_mode: CharacterMode,
+) {
+    match escaped {
+        EscapedChar::Byte(b) if character_mode == CharacterMode::Utf8 && b > 0x7F => {
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(byte_marker(b).encode_utf8(&mut buf).as_bytes());
+        }
+        EscapedChar::Byte(b) => bytes.push(b),
+        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
+    }
+}
+
+/// Append an escaped character for a bracket expression's own content (inside the `[...]`,
+/// not the surrounding pattern). Verified against the real oracle: unlike everywhere else, a
+/// `\dNNN`/`\oNNN`/`\xHH` byte escape above ASCII contributes *nothing at all* to a bracket
+/// expression under `CharacterMode::Utf8` — `[a\xffb-d]` matches exactly what `[ab-d]` does,
+/// neither the raw byte 0xFF nor the Unicode character U+00FF (checked both ways: a literal
+/// 0xFF byte and a literal 'ÿ' character in the input, under `LC_ALL=C.UTF-8`, both left
+/// unmatched by `s/[\xff]/X/`). So this drops it silently, matching that real (if surprising)
+/// GNU behavior, rather than the pattern/replacement/`y///` contexts' `EscapedChar::Byte`
+/// handling — none of which apply here, since GNU itself does not make this byte matchable.
+fn push_class_escaped_char(
+    bytes: &mut Vec<u8>,
+    escaped: EscapedChar,
+    character_mode: CharacterMode,
+) {
+    match escaped {
+        EscapedChar::Byte(b) if character_mode == CharacterMode::Utf8 && b > 0x7F => {}
+        EscapedChar::Byte(b) => bytes.push(b),
+        EscapedChar::Char(ch) => push_script_char(bytes, ch, character_mode),
+    }
+}
+
 /// Decode parsed script bytes as UTF-8 for character-mode parsing.
 fn parsed_bytes_to_utf8(
     lines: &ScriptLineProvider,
@@ -126,35 +251,44 @@ fn parsed_bytes_to_utf8(
 /// At entry line.current() must have advanced after the `\\`.
 /// Advance line to the first character not part of the escape.
 /// Return `None` if an invalid escape has been specified.
-pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
+pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<EscapedChar> {
+    // A numeric escape whose value fits a byte (`\dNNN`, `\oNNN`, always for `\xHH`) is GNU's
+    // own literal-byte escape, not a Unicode codepoint one — see `EscapedChar::Byte`.
+    let numeric = |decoded: char| {
+        if (decoded as u32) <= 0xFF {
+            EscapedChar::Byte(decoded as u8)
+        } else {
+            EscapedChar::Char(decoded)
+        }
+    };
     match line.current() {
         'a' => {
             line.advance();
-            Some('\x07')
+            Some(EscapedChar::Char('\x07'))
         }
         'b' => {
             line.advance();
-            Some('\x08')
+            Some(EscapedChar::Char('\x08'))
         }
         'f' => {
             line.advance();
-            Some('\x0c')
+            Some(EscapedChar::Char('\x0c'))
         }
         'n' => {
             line.advance();
-            Some('\n')
+            Some(EscapedChar::Char('\n'))
         }
         'r' => {
             line.advance();
-            Some('\r')
+            Some(EscapedChar::Char('\r'))
         }
         't' => {
             line.advance();
-            Some('\t')
+            Some(EscapedChar::Char('\t'))
         }
         'v' => {
             line.advance();
-            Some('\x0b')
+            Some(EscapedChar::Char('\x0b'))
         }
 
         'c' => {
@@ -163,9 +297,9 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
             match create_control_char(line.current()) {
                 Some(decoded) => {
                     line.advance();
-                    Some(decoded)
+                    Some(EscapedChar::Char(decoded))
                 }
-                None => Some('c'),
+                None => Some(EscapedChar::Char('c')),
             }
         }
 
@@ -173,8 +307,8 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
             // Decimal escape: \dnnn
             line.advance(); // move past 'd'
             match parse_numeric_escape(line, |c| c.is_ascii_digit(), 3, 10) {
-                Some(decoded) => Some(decoded),
-                None => Some('d'),
+                Some(decoded) => Some(numeric(decoded)),
+                None => Some(EscapedChar::Char('d')),
             }
         }
 
@@ -182,8 +316,8 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
             // Octal escape: \onnn
             line.advance(); // move past 'o'
             match parse_numeric_escape(line, is_ascii_octal_digit, 3, 8) {
-                Some(decoded) => Some(decoded),
-                None => Some('o'),
+                Some(decoded) => Some(numeric(decoded)),
+                None => Some(EscapedChar::Char('o')),
             }
         }
 
@@ -191,8 +325,8 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
             // Short Unicode escape \uXXXX (exactly four hex digits)
             line.advance(); // move past 'x'
             match parse_numeric_escape(line, |c| c.is_ascii_hexdigit(), 4, 16) {
-                Some(decoded) => Some(decoded),
-                None => Some('u'),
+                Some(decoded) => Some(EscapedChar::Char(decoded)),
+                None => Some(EscapedChar::Char('u')),
             }
         }
 
@@ -200,17 +334,17 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
             // Short Unicode escape \UXXXXXXXX (exactly eight hex digits)
             line.advance(); // move past 'x'
             match parse_numeric_escape(line, |c| c.is_ascii_hexdigit(), 8, 16) {
-                Some(decoded) => Some(decoded),
-                None => Some('U'),
+                Some(decoded) => Some(EscapedChar::Char(decoded)),
+                None => Some(EscapedChar::Char('U')),
             }
         }
 
         'x' => {
-            // Hexadecimal escape: \xnn
+            // Hexadecimal escape: \xnn -- always a byte value (at most two hex digits).
             line.advance(); // move past 'x'
             match parse_numeric_escape(line, |c| c.is_ascii_hexdigit(), 2, 16) {
-                Some(decoded) => Some(decoded),
-                None => Some('x'),
+                Some(decoded) => Some(numeric(decoded)),
+                None => Some(EscapedChar::Char('x')),
             }
         }
         _ => None,
@@ -237,10 +371,18 @@ fn parse_character_class(
     result.push(b'[');
 
     // Optional negation
-    if !line.eol() && line.current() == '^' {
+    let negated = !line.eol() && line.current() == '^';
+    if negated {
         result.push(b'^');
         line.advance();
     }
+
+    // Where this class's own members start, past its `[`/`^`: if nothing is added past this
+    // point (every member turned out to be a dropped byte escape — see
+    // `push_class_escaped_char` — and there was no leading `]` literal either), the class is
+    // empty, which needs its own handling below. A leading `]` (checked next) is itself a real
+    // member, so this is captured before that check, not after it.
+    let members_start = result.len();
 
     // Optional leading ']' inside the class
     if !line.eol() && line.current() == ']' {
@@ -252,6 +394,24 @@ fn parse_character_class(
         let ch = line.current();
 
         if ch == ']' {
+            if result.len() == members_start {
+                // Every member this class would have had was a byte escape above ASCII in
+                // `CharacterMode::Utf8`, silently dropped (see `push_class_escaped_char`) —
+                // verified against the oracle, `[\xff]` matches nothing at all under a UTF-8
+                // locale, and `[^\xff]` matches any (valid) character. Neither is expressible
+                // as a bracket expression with zero members (the `regex`/`fancy_regex` crates
+                // reject `[]`/`[^]` outright, unlike glibc's own regex), so substitute the
+                // equivalent construct directly: `\b\B` can never be true at the same position
+                // (a never-match, whatever surrounds it — safe under `bre_to_ere` too, since
+                // neither character is one of its escape-sensitive ones), and `.` matches any
+                // character now that `fast_regex::ensure_dotall` makes it include newline too.
+                line.advance();
+                return Ok(if negated {
+                    b".".to_vec()
+                } else {
+                    br"\b\B".to_vec()
+                });
+            }
             result.push(b']');
             line.advance();
             return Ok(result);
@@ -318,7 +478,7 @@ fn parse_character_class(
                 break;
             }
             if let Some(decoded) = parse_char_escape(line) {
-                push_script_char(&mut result, decoded, character_mode);
+                push_class_escaped_char(&mut result, decoded, character_mode);
             } else {
                 result.push(b'\\');
                 result.push(line.current_byte());
@@ -341,10 +501,10 @@ fn scan_delimiter(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> 
         return compilation_error(lines, line, "unexpected end of line".to_string());
     }
 
+    // GNU accepts a backslash as a delimiter — verified against the oracle for both `s\a\b\`
+    // and `y\a\b\`, run with no error at all; this fork's own earlier, unverified assumption
+    // that it should be refused up front was wrong.
     let delimiter = line.current();
-    if delimiter == '\\' {
-        return compilation_error(lines, line, "\\ cannot be used as a string delimiter");
-    }
     line.advance(); // skip the opening delimiter
     Ok(delimiter)
 }
@@ -359,26 +519,49 @@ pub fn parse_regex(
     line: &mut ScriptCharProvider,
     regex_mode: RegexMode,
 ) -> UResult<Vec<u8>> {
-    parse_regex_for_mode(lines, line, regex_mode, CharacterMode::Utf8)
+    parse_regex_for_mode(lines, line, regex_mode, CharacterMode::Utf8, false)
 }
 
 /// Parse a regular expression according to the current character mode.
+// One character-dispatch loop reading GNU's BRE and ERE dialects (word-boundary escapes,
+// `--posix` extension toggling, `{m,n}` intervals, stacked-quantifier detection) in one
+// pass, so the two dialects' handling for each construct sits next to each other rather
+// than in separate, drifting copies.
+#[allow(clippy::cognitive_complexity)]
 pub fn parse_regex_for_mode(
     lines: &ScriptLineProvider,
     line: &mut ScriptCharProvider,
     regex_mode: RegexMode,
     character_mode: CharacterMode,
+    posix: bool,
 ) -> UResult<Vec<u8>> {
     let delimiter = scan_delimiter(lines, line)?;
     let mut result = Vec::new();
+    // POSIX has no lazy quantifiers, so a `?`/`\?` stacked straight onto a quantifier
+    // that was just emitted (`a+?`, `a\{2,3\}\?`, a bare `*` followed by `?`, ...) is a
+    // no-op re-quantification in GNU, not Perl-style laziness — which is what it would
+    // read as if passed through unchanged, since the underlying RE engine (`regex`/
+    // `fancy_regex`) gives `+`/`*`/`?`/`{m,n}` their usual Rust-regex meaning either way.
+    let mut just_quantified = false;
+    // Between a `{`/`\{` that opened a recognized `{m,n}` interval and its closing
+    // `}`/`\}` — so that closing brace only counts as "just quantified" when it's really
+    // closing one, not when it's a literal brace.
+    let mut in_interval = false;
     while !line.eol() {
+        let quantified = just_quantified;
+        just_quantified = false;
         match line.current() {
             '[' if delimiter != '[' => {
                 let cc = parse_character_class(lines, line, character_mode)?;
                 result.extend_from_slice(&cc);
                 continue;
             }
-            '\\' => {
+            // Guarded the same way every other special character below is: when the delimiter
+            // IS `\`, seeing one closes the pattern (the `c if c == delimiter` arm further down)
+            // rather than starting an escape sequence — GNU checks for the closing delimiter
+            // before anything else, verified against the oracle (`s\a\b\` closes on the very
+            // first `\` after each of "a" and "b", it doesn't read as an unterminated escape).
+            '\\' if delimiter != '\\' => {
                 line.advance();
                 if line.eol() {
                     return compilation_error(lines, line, "unterminated regular expression");
@@ -389,22 +572,71 @@ pub fn parse_regex_for_mode(
                     line.advance();
                     continue;
                 }
+                // `--posix` turns off the GNU BRE/ERE extensions `\+`, `\?` and `\|`
+                // (one-or-more, zero-or-one, alternation): POSIX doesn't define them, so
+                // GNU sed matches them as plain literal characters instead.
+                if posix && matches!(line.current(), '+' | '?' | '|') {
+                    result.push(line.current_byte());
+                    line.advance();
+                    continue;
+                }
                 if line.current() == '{' && matches!(regex_mode, RegexMode::Basic) {
                     validate_quantifier_structure(lines, line, delimiter, RegexMode::Basic)?;
                     let quantifier = validate_quantifier_numbers(lines, line)?;
                     result.push(b'\\');
                     result.push(b'{');
                     result.extend_from_slice(quantifier.as_bytes());
+                    in_interval = true;
                     continue;
                 }
                 if line.current() == '}' {
                     result.push(b'\\');
                     result.push(b'}');
                     line.advance();
+                    if in_interval {
+                        in_interval = false;
+                        just_quantified = true;
+                    }
+                    continue;
+                }
+                if line.current() == '+' {
+                    result.push(b'\\');
+                    result.push(b'+');
+                    line.advance();
+                    just_quantified = true;
+                    continue;
+                }
+                if line.current() == '?' {
+                    if !quantified {
+                        result.push(b'\\');
+                        result.push(b'?');
+                    } // else: redundant — drop it rather than let it read as lazy.
+                    line.advance();
+                    just_quantified = true;
+                    continue;
+                }
+                // GNU word-boundary escapes are RE assertions, not character escapes:
+                // `\b` must reach the RE engine as a word-boundary assertion (`\x08` is
+                // spelled `\cH` or `\x08` in a GNU sed RE), and `\<`/`\>` (word start/end,
+                // which no supported RE engine spells natively) are translated into
+                // lookaround assertions built on `\w`.
+                if line.current() == 'b' {
+                    result.extend_from_slice(br"\b");
+                    line.advance();
+                    continue;
+                }
+                if line.current() == '<' {
+                    result.extend_from_slice(br"(?<!\w)(?=\w)");
+                    line.advance();
+                    continue;
+                }
+                if line.current() == '>' {
+                    result.extend_from_slice(br"(?<=\w)(?!\w)");
+                    line.advance();
                     continue;
                 }
                 if let Some(decoded) = parse_char_escape(line) {
-                    push_script_char(&mut result, decoded, character_mode);
+                    push_pattern_escaped_char(&mut result, decoded, character_mode, regex_mode);
                 } else {
                     // Pass through \<any> to RE engine for further treatment
                     result.push(b'\\');
@@ -418,11 +650,36 @@ pub fn parse_regex_for_mode(
                 let quantifier = validate_quantifier_numbers(lines, line)?;
                 result.push(b'{');
                 result.extend_from_slice(quantifier.as_bytes());
+                in_interval = true;
                 continue;
             }
             '}' if delimiter != '}' => {
                 result.push(b'}');
                 line.advance();
+                if in_interval {
+                    in_interval = false;
+                    just_quantified = true;
+                }
+                continue;
+            }
+            '*' if delimiter != '*' => {
+                result.push(b'*');
+                line.advance();
+                just_quantified = true;
+                continue;
+            }
+            '+' if delimiter != '+' && matches!(regex_mode, RegexMode::Extended) => {
+                result.push(b'+');
+                line.advance();
+                just_quantified = true;
+                continue;
+            }
+            '?' if delimiter != '?' && matches!(regex_mode, RegexMode::Extended) => {
+                if !quantified {
+                    result.push(b'?');
+                } // else: redundant — drop it rather than let it read as lazy.
+                line.advance();
+                just_quantified = true;
                 continue;
             }
 
@@ -607,7 +864,10 @@ fn parse_transliteration_bytes(
 
     while !line.eol() {
         match line.current() {
-            '\\' => {
+            // Same reasoning as `parse_regex_for_mode`'s own guard: when `\` is itself the
+            // delimiter, it closes the operand (the `c if c == delimiter` arm below) instead of
+            // starting an escape — verified against the oracle (`y\a\b\` closes cleanly).
+            '\\' if delimiter != '\\' => {
                 line.advance();
                 if line.eol() {
                     return compilation_error(lines, line, "unterminated transliteration string");
@@ -619,7 +879,7 @@ fn parse_transliteration_bytes(
                     continue;
                 }
                 if let Some(decoded) = parse_char_escape(line) {
-                    push_script_char(&mut result, decoded, character_mode);
+                    push_transliteration_escaped_char(&mut result, decoded, character_mode);
                 } else {
                     // Pass through \<any> to tr for literal use
                     result.push(b'\\');
@@ -816,7 +1076,7 @@ mod tests {
     }
 
     // parse_char_escape
-    fn escape_result_with_current(input: &str) -> (Option<char>, Option<char>) {
+    fn escape_result_with_current(input: &str) -> (Option<EscapedChar>, Option<char>) {
         let mut provider = ScriptCharProvider::new(input);
         let result = parse_char_escape(&mut provider);
         let current = if provider.eol() {
@@ -829,22 +1089,58 @@ mod tests {
 
     #[test]
     fn test_standard_escapes_eol() {
-        assert_eq!(escape_result_with_current("a"), (Some('\x07'), None));
-        assert_eq!(escape_result_with_current("f"), (Some('\x0c'), None));
-        assert_eq!(escape_result_with_current("n"), (Some('\n'), None));
-        assert_eq!(escape_result_with_current("r"), (Some('\r'), None));
-        assert_eq!(escape_result_with_current("t"), (Some('\t'), None));
-        assert_eq!(escape_result_with_current("v"), (Some('\x0b'), None));
+        assert_eq!(
+            escape_result_with_current("a"),
+            (Some(EscapedChar::Char('\x07')), None)
+        );
+        assert_eq!(
+            escape_result_with_current("f"),
+            (Some(EscapedChar::Char('\x0c')), None)
+        );
+        assert_eq!(
+            escape_result_with_current("n"),
+            (Some(EscapedChar::Char('\n')), None)
+        );
+        assert_eq!(
+            escape_result_with_current("r"),
+            (Some(EscapedChar::Char('\r')), None)
+        );
+        assert_eq!(
+            escape_result_with_current("t"),
+            (Some(EscapedChar::Char('\t')), None)
+        );
+        assert_eq!(
+            escape_result_with_current("v"),
+            (Some(EscapedChar::Char('\x0b')), None)
+        );
     }
 
     #[test]
     fn test_standard_escapes_more() {
-        assert_eq!(escape_result_with_current("a."), (Some('\x07'), Some('.')));
-        assert_eq!(escape_result_with_current("f."), (Some('\x0c'), Some('.')));
-        assert_eq!(escape_result_with_current("n."), (Some('\n'), Some('.')));
-        assert_eq!(escape_result_with_current("r."), (Some('\r'), Some('.')));
-        assert_eq!(escape_result_with_current("t."), (Some('\t'), Some('.')));
-        assert_eq!(escape_result_with_current("v."), (Some('\x0b'), Some('.')));
+        assert_eq!(
+            escape_result_with_current("a."),
+            (Some(EscapedChar::Char('\x07')), Some('.'))
+        );
+        assert_eq!(
+            escape_result_with_current("f."),
+            (Some(EscapedChar::Char('\x0c')), Some('.'))
+        );
+        assert_eq!(
+            escape_result_with_current("n."),
+            (Some(EscapedChar::Char('\n')), Some('.'))
+        );
+        assert_eq!(
+            escape_result_with_current("r."),
+            (Some(EscapedChar::Char('\r')), Some('.'))
+        );
+        assert_eq!(
+            escape_result_with_current("t."),
+            (Some(EscapedChar::Char('\t')), Some('.'))
+        );
+        assert_eq!(
+            escape_result_with_current("v."),
+            (Some(EscapedChar::Char('\x0b')), Some('.'))
+        );
     }
 
     #[test]
@@ -854,27 +1150,43 @@ mod tests {
 
     #[test]
     fn test_control_escape_valid() {
-        assert_eq!(escape_result_with_current("cZ"), (Some('\x1A'), None));
+        assert_eq!(
+            escape_result_with_current("cZ"),
+            (Some(EscapedChar::Char('\x1A')), None)
+        );
     }
 
     #[test]
     fn test_control_escape_invalid() {
-        assert_eq!(escape_result_with_current("cé"), (Some('c'), Some('Ã')));
+        assert_eq!(
+            escape_result_with_current("cé"),
+            (Some(EscapedChar::Char('c')), Some('Ã'))
+        );
     }
 
     #[test]
     fn test_decimal_escape_valid() {
-        assert_eq!(escape_result_with_current("d065r"), (Some('A'), Some('r')));
+        // \d065 is GNU's byte escape: 65 ('A') fits a byte, so it decodes as a raw byte.
+        assert_eq!(
+            escape_result_with_current("d065r"),
+            (Some(EscapedChar::Byte(b'A')), Some('r'))
+        );
     }
 
     #[test]
     fn test_octal_escape_valid() {
-        assert_eq!(escape_result_with_current("o141x"), (Some('a'), Some('x')));
+        assert_eq!(
+            escape_result_with_current("o141x"),
+            (Some(EscapedChar::Byte(b'a')), Some('x'))
+        );
     }
 
     #[test]
     fn test_hex_escape_valid() {
-        assert_eq!(escape_result_with_current("x41;"), (Some('A'), Some(';')));
+        assert_eq!(
+            escape_result_with_current("x41;"),
+            (Some(EscapedChar::Byte(b'A')), Some(';'))
+        );
     }
 
     #[test]
@@ -893,30 +1205,42 @@ mod tests {
 
     #[test]
     fn test_short_unicode_escape_valid() {
-        assert_eq!(escape_result_with_current("u2665;"), (Some('♥'), Some(';')));
+        assert_eq!(
+            escape_result_with_current("u2665;"),
+            (Some(EscapedChar::Char('♥')), Some(';'))
+        );
     }
 
     #[test]
     fn test_long_unicode_escape_valid() {
         assert_eq!(
             escape_result_with_current("U0001F600;"),
-            (Some('😀'), Some(';'))
+            (Some(EscapedChar::Char('😀')), Some(';'))
         );
     }
 
     #[test]
     fn test_decimal_escape_fallback() {
-        assert_eq!(escape_result_with_current("d;."), (Some('d'), Some(';')));
+        assert_eq!(
+            escape_result_with_current("d;."),
+            (Some(EscapedChar::Char('d')), Some(';'))
+        );
     }
 
     #[test]
     fn test_octal_escape_fallback() {
-        assert_eq!(escape_result_with_current("o9x"), (Some('o'), Some('9')));
+        assert_eq!(
+            escape_result_with_current("o9x"),
+            (Some(EscapedChar::Char('o')), Some('9'))
+        );
     }
 
     #[test]
     fn test_hex_escape_fallback() {
-        assert_eq!(escape_result_with_current("xyz"), (Some('x'), Some('y')));
+        assert_eq!(
+            escape_result_with_current("xyz"),
+            (Some(EscapedChar::Char('x')), Some('y'))
+        );
     }
 
     #[test]
@@ -963,6 +1287,53 @@ mod tests {
         let lines = test_lines();
         let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
         assert_eq!(result, b"[^]abc]");
+    }
+
+    // A `\dNNN`/`\oNNN`/`\xHH` byte escape above ASCII, in `CharacterMode::Utf8`, contributes
+    // nothing to a bracket expression's members — verified against the oracle: `[\xff]`
+    // matches neither the raw byte 0xFF nor the Unicode character U+00FF ('ÿ') under a real
+    // `LC_ALL=C.UTF-8`. `push_class_escaped_char`/`parse_character_class`'s empty-class handling
+    // covers the cases below; `CharacterMode::Byte` is unaffected (`byte_regex_pattern`
+    // downstream already handles it, same as outside a class).
+
+    #[test]
+    fn test_byte_escape_dropped_among_other_members() {
+        let mut line = char_provider_from("[a\\xffb-d]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, b"[ab-d]");
+    }
+
+    #[test]
+    fn test_byte_escape_only_becomes_never_matches() {
+        let mut line = char_provider_from("[\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, br"\b\B");
+    }
+
+    #[test]
+    fn test_negated_byte_escape_only_becomes_matches_anything() {
+        let mut line = char_provider_from("[^\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, b".");
+    }
+
+    #[test]
+    fn test_byte_escape_after_leading_close_bracket_keeps_the_literal() {
+        let mut line = char_provider_from("[]\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Utf8).unwrap();
+        assert_eq!(result, b"[]]");
+    }
+
+    #[test]
+    fn test_byte_escape_in_byte_mode_is_unaffected() {
+        let mut line = char_provider_from("[\\xff]");
+        let lines = test_lines();
+        let result = parse_character_class(&lines, &mut line, CharacterMode::Byte).unwrap();
+        assert_eq!(result, b"[\xff]");
     }
 
     #[test]
@@ -1141,6 +1512,52 @@ mod tests {
     }
 
     #[test]
+    // FB-067: `?` stacked onto a quantifier is a redundant no-op in GNU, not the lazy
+    // modifier it would read as if passed straight through to the RE engine.
+    fn test_extended_regex_drops_redundant_question_mark_after_quantifier() {
+        let (lines, mut line) = make_providers("/a+?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a+"
+        );
+        let (lines, mut line) = make_providers("/a*?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a*"
+        );
+        let (lines, mut line) = make_providers("/a??/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a?"
+        );
+        let (lines, mut line) = make_providers("/a{2,3}?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"a{2,3}"
+        );
+        // A `?` that is NOT immediately after a quantifier stays a real quantifier.
+        let (lines, mut line) = make_providers("/ab?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Extended).unwrap(),
+            b"ab?"
+        );
+    }
+
+    #[test]
+    fn test_basic_regex_drops_redundant_question_mark_after_quantifier() {
+        let (lines, mut line) = make_providers(r"/a\+\?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
+            br"a\+"
+        );
+        let (lines, mut line) = make_providers(r"/a\{2,3\}\?/p");
+        assert_eq!(
+            parse_regex(&lines, &mut line, RegexMode::Basic).unwrap(),
+            br"a\{2,3\}"
+        );
+    }
+
+    #[test]
     fn test_extended_regex_with_unmatched_brace_quantifier() {
         let (lines, mut line) = make_providers("/a{2,3/p");
         let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
@@ -1197,13 +1614,17 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_backslash_delimiter() {
+    fn accepts_backslash_as_delimiter() {
+        // GNU accepts a backslash as a delimiter — verified against the oracle for both `s` and
+        // `y`. An unclosed one (no second `\`) still reports the ordinary unterminated-regex
+        // error, the same as any other delimiter would.
         let (lines, mut line) = make_providers("\\bad");
         let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("\\ cannot be used as a string delimiter")
-        );
+        assert!(err.to_string().contains("unterminated regular expression"));
+
+        let (lines, mut line) = make_providers("\\bad\\");
+        let pattern = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
+        assert_eq!(pattern, b"bad");
     }
 
     #[test]
@@ -1458,10 +1879,16 @@ mod tests {
 
     #[test]
     fn test_parse_transliteration_for_mode_utf8() {
+        // `\xE9` is GNU's byte escape (raw byte 0xE9), not the Unicode character 'é' (U+00E9):
+        // it comes back as this module's private-use marker for that byte (see
+        // `push_transliteration_escaped_char`/`byte_from_marker`), not the character itself.
         let (lines, mut line) = make_providers("/a\\xE9/");
         let parsed =
             parse_transliteration_for_mode(&lines, &mut line, CharacterMode::Utf8).unwrap();
-        assert_eq!(parsed, ParsedTransliteration::Text("aé".to_string()));
+        assert_eq!(
+            parsed,
+            ParsedTransliteration::Text(format!("a{}", byte_marker(0xE9)))
+        );
         assert_eq!(line.current(), '/');
     }
 

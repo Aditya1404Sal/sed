@@ -8,8 +8,10 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
+use crate::sed::delimited_parser::byte_from_marker;
 use crate::sed::error_handling::{ScriptLocation, runtime_error};
 use crate::sed::fast_regex::{Captures, Match, Regex};
+use crate::sed::named_reader::NamedReader;
 use crate::sed::named_writer::NamedWriter;
 use crate::sed::script_char_provider::ScriptCharProvider;
 use crate::sed::script_line_provider::ScriptLineProvider;
@@ -373,10 +375,16 @@ impl Transliteration {
         } else {
             self.unicode_slow.insert(from, to);
         }
-        if from.is_ascii() && to.is_ascii() {
-            self.byte_fast[from as usize] = to as u8;
-        } else {
-            self.is_byte_identity = false;
+        // A numeric escape (`\dNNN`, `\oNNN`, `\xHH`) above ASCII reaches here as one of
+        // `delimited_parser`'s private-use markers rather than the byte itself, so a Rust
+        // `String` operand can stay valid UTF-8 — see `push_transliteration_escaped_char`.
+        // Decode it back to the byte GNU would have inserted before deciding whether this
+        // mapping can use the byte-fast path.
+        let from_byte = byte_from_marker(from).or_else(|| from.is_ascii().then_some(from as u8));
+        let to_byte = byte_from_marker(to).or_else(|| to.is_ascii().then_some(to as u8));
+        match (from_byte, to_byte) {
+            (Some(from_byte), Some(to_byte)) => self.byte_fast[from_byte as usize] = to_byte,
+            _ => self.is_byte_identity = false,
         }
     }
 
@@ -443,6 +451,7 @@ pub enum CommandData {
     Label(Option<String>),                      // Label name for 'b', 't', 'T', ':'
     Path(PathBuf),                              // File path for 'r'
     NamedWriter(Rc<RefCell<NamedWriter>>),      // File output for 'w'
+    NamedReader(Rc<RefCell<NamedReader>>),      // One line at a time input for 'R' (GNU)
     Number(usize),                              // Number for 'l', 'q', 'Q' (GNU)
     Substitution(Box<Substitution>),            // Substitute command 's'
     Text(Rc<[u8]>),                             // Text for 'a', 'c', 'i'
@@ -464,6 +473,12 @@ pub struct InputAction {
     /// Data to prepend to the read contents (`N`); `None` replaces the
     /// pattern space with the next line (`n`).
     pub prepend: Option<Vec<u8>>,
+    /// Whether the line `prepend` came from (the one `N` was executed against) was itself
+    /// terminated by the input's delimiter. If `N` never gets a next line (input ends right
+    /// after), GNU's "print the pending pattern space" fallback must preserve that: it must
+    /// NOT add a delimiter that wasn't there, e.g. `printf 'a' | sed 'N'` (no trailing newline
+    /// in the input) must not gain one in the output. Only meaningful with `prepend: Some(_)`.
+    pub terminated: bool,
 }
 
 #[cfg(test)]

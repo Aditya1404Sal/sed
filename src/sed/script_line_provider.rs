@@ -13,13 +13,17 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
-use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult};
+use uucore::error::{UResult, USimpleError};
 
 #[derive(Debug, PartialEq)]
 /// The specification of a script: through a string or a file
 pub enum ScriptValue {
-    StringVal(String),
+    /// Raw script bytes (`-e`, or the first-POSIX-form positional script argument): bytes, not
+    /// `String`, so a raw byte from the shell (e.g. `x=$'\xff'; sed "s/$x/X/"`) survives as
+    /// that exact byte, rather than needing to already be valid UTF-8 to reach here at all (a
+    /// `String`-typed clap argument turns away anything less with "invalid utf-8 was detected
+    /// in one or more arguments" before this code ever runs).
+    StringVal(Vec<u8>),
     PathVal(PathBuf),
 }
 
@@ -29,6 +33,15 @@ pub enum ScriptValue {
 pub struct ScriptLineProvider {
     sources: Vec<ScriptValue>,
     state: State,
+    /// The last `Active` source's own name and line number, kept once `state` has moved past
+    /// it (to the next source, or to `Done`) — so a caller reporting "unterminated" once
+    /// `next_line` finally returns `None` still names the source that ran out, instead of the
+    /// no-current-source defaults `get_input_name`/`get_line_number` would otherwise fall back
+    /// to. Verified against the oracle: GNU's own "-e expression #1, char 5: unterminated `s'
+    /// command" still names expression #1 even though, by the time it's reported, `-e` #1's
+    /// content has already been entirely consumed.
+    last_input_name: String,
+    last_line_number: usize,
 }
 
 /// Encapsulation of the script line provider's state
@@ -49,22 +62,26 @@ impl ScriptLineProvider {
         Self {
             sources,
             state: State::NotStarted,
+            last_input_name: String::new(),
+            last_line_number: 0,
         }
     }
 
-    /// Return the currently processed script line number.
+    /// Return the currently processed script line number, or the last one that was active if
+    /// none is right now (see `last_line_number`'s own comment).
     pub fn get_line_number(&self) -> usize {
         match &self.state {
             State::Active { line_number, .. } => *line_number,
-            _ => 0,
+            _ => self.last_line_number,
         }
     }
 
-    /// Return the currently processed script descriptive name.
+    /// Return the currently processed script descriptive name, or the last one that was active
+    /// if none is right now (see `last_input_name`'s own comment).
     pub fn get_input_name(&self) -> &str {
         match &self.state {
             State::Active { input_name, .. } => input_name.as_str(),
-            _ => "",
+            _ => &self.last_input_name,
         }
     }
 
@@ -107,6 +124,18 @@ impl ScriptLineProvider {
 
     // Move to the next available script source.
     fn advance_source(&mut self, next_index: usize) -> UResult<()> {
+        // Remember this source's own name and line number (see `last_input_name`'s own
+        // comment) before leaving it, whether for the next source or for `Done`.
+        if let State::Active {
+            input_name,
+            line_number,
+            ..
+        } = &self.state
+        {
+            self.last_input_name.clone_from(input_name);
+            self.last_line_number = *line_number;
+        }
+
         if next_index >= self.sources.len() {
             self.state = State::Done;
             return Ok(());
@@ -114,7 +143,7 @@ impl ScriptLineProvider {
 
         match &self.sources[next_index] {
             ScriptValue::StringVal(s) => {
-                let cursor = std::io::Cursor::new(s.as_bytes().to_vec());
+                let cursor = std::io::Cursor::new(s.clone());
                 self.state = State::Active {
                     index: next_index,
                     reader: Box::new(BufReader::new(cursor)),
@@ -131,8 +160,18 @@ impl ScriptLineProvider {
                         line_number: 0,
                     };
                 } else {
-                    let file = File::open(p)
-                        .map_err_context(|| format!("error opening script file {}", p.quote()))?;
+                    // GNU's own wording and exit status, verified against the oracle
+                    // (`sed -f nosuchfile` -> "couldn't open file nosuchfile: No such file or
+                    // directory", status 4, with no `-e expression #N` location prefix at all —
+                    // this isn't a script *syntax* error, it's a plain file-open failure).
+                    // `io::Error`'s own `Display` appends a "(os error N)" suffix under
+                    // wasm32-wasip2 that GNU's own message never has, so it's stripped here the
+                    // same way the `-i`/`-s` file-open path already does (FA-082).
+                    let file = File::open(p).map_err(|error| {
+                        let text = error.to_string();
+                        let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                        USimpleError::new(4, format!("couldn't open file {}: {text}", p.display()))
+                    })?;
                     self.state = State::Active {
                         index: next_index,
                         reader: Box::new(BufReader::new(file)),
@@ -179,6 +218,8 @@ impl ScriptLineProvider {
                 index: 0,
                 reader: Box::new(BufReader::new(io::stdin())),
             },
+            last_input_name: String::new(),
+            last_line_number: 0,
         }
     }
 }
@@ -192,8 +233,8 @@ mod tests {
     #[test]
     fn test_string_source() {
         let input = vec![
-            ScriptValue::StringVal("line one\nline two\n".to_string()),
-            ScriptValue::StringVal("line three".to_string()),
+            ScriptValue::StringVal(b"line one\nline two\n".to_vec()),
+            ScriptValue::StringVal(b"line three".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(input);
 
@@ -231,11 +272,11 @@ mod tests {
 
         let input = vec![
             ScriptValue::PathVal(temp_file.path().to_path_buf()),
-            ScriptValue::StringVal("script line 1".to_string()),
+            ScriptValue::StringVal(b"script line 1".to_vec()),
             ScriptValue::PathVal(temp_file.path().to_path_buf()),
-            ScriptValue::StringVal(String::new()),
+            ScriptValue::StringVal(Vec::new()),
             ScriptValue::PathVal(temp_file2.path().to_path_buf()),
-            ScriptValue::StringVal("other script line 1".to_string()),
+            ScriptValue::StringVal(b"other script line 1".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(input);
 
@@ -260,8 +301,8 @@ mod tests {
     #[test]
     fn test_getters() {
         let input = vec![
-            ScriptValue::StringVal("l1\nl2\n".to_string()),
-            ScriptValue::StringVal("l3".to_string()),
+            ScriptValue::StringVal(b"l1\nl2\n".to_vec()),
+            ScriptValue::StringVal(b"l3".to_vec()),
         ];
         let mut provider = ScriptLineProvider::new(input);
 

@@ -16,6 +16,7 @@ use assert_fs::fixture::{FileWriteStr, PathChild};
 
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
+use uutests::at_and_ucmd;
 use uutests::new_ucmd;
 
 ////////////////////////////////////////////////////////////
@@ -23,6 +24,31 @@ use uutests::new_ucmd;
 #[test]
 fn test_invalid_arg() {
     new_ucmd!().arg("--definitely-invalid").fails().code_is(1);
+}
+
+#[test]
+fn test_version_command_is_a_no_op() {
+    new_ucmd!()
+        .arg("v")
+        .pipe_in("a\n")
+        .succeeds()
+        .stdout_is("a\n");
+    // The version ends at `;` or a space, and compares as GNU's strverscmp does.
+    for script in ["v 4.2;p", "v 3.99;p", "v 4.9 ; p"] {
+        new_ucmd!()
+            .args(&["-n", script])
+            .pipe_in("a\n")
+            .succeeds()
+            .stdout_is("a\n");
+    }
+    for script in ["v 4.10", "v 5;p"] {
+        new_ucmd!()
+            .arg(script)
+            .pipe_in("a\n")
+            .fails()
+            .code_is(1)
+            .stderr_contains("expected newer version of sed");
+    }
 }
 
 #[test]
@@ -643,7 +669,8 @@ fn subst_backref_rejected_in_c_locale() {
         .env("LC_ALL", "C")
         .args(&["-e", r"s/\(.\)\1/X/"])
         .fails()
-        .stderr_contains("back-references are not supported in byte mode");
+        .stderr_contains("back-references")
+        .stderr_contains("not supported in byte mode");
 }
 
 /// Allow substitution back-references when the locale selects UTF-8 mode.
@@ -772,11 +799,13 @@ fn test_subst_flags_pe_print_then_execute() {
 
 #[test]
 fn test_subst_e_flag_rejected_with_posix() {
-    // e flag is rejected at compile time if --posix or --sandbox is provided.
+    // GNU's own wording, verified against the oracle: --posix doesn't know the `e` flag exists
+    // at all, so it's rejected the same as any other unrecognized flag — a dedicated "not
+    // allowed" refusal is --sandbox's own, tested separately below.
     new_ucmd!()
         .args(&["--posix", "s/.*/echo hi/e"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("unknown option to `s'");
 }
 
 #[test]
@@ -784,7 +813,7 @@ fn test_subst_e_flag_rejected_with_sandbox() {
     new_ucmd!()
         .args(&["--sandbox", "s/.*/echo hi/e"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 }
 
 #[test]
@@ -1007,10 +1036,13 @@ fn test_e_command_dangling_backslash_falls_back_to_no_arg() {
 
 #[test]
 fn test_e_command_rejected_with_posix() {
+    // GNU's own wording, verified against the oracle: --posix simply doesn't recognize `e` as a
+    // command at all (a GNU extension entirely absent under --posix), the same as any other
+    // GNU-only command letter — --sandbox's own dedicated refusal is tested separately below.
     new_ucmd!()
         .args(&["--posix", "e echo hi"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("unknown command: `e'");
 }
 
 #[test]
@@ -1018,7 +1050,7 @@ fn test_e_command_rejected_with_sandbox() {
     new_ucmd!()
         .args(&["--sandbox", "e echo hi"])
         .fails()
-        .stderr_contains("not allowed with --posix or --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 }
 
 #[cfg(unix)]
@@ -1119,7 +1151,10 @@ fn trans_utf8_character_in_c_utf8_locale() {
         .stdout_is_bytes(b"Ka\n");
 }
 
-/// Transliterate a decoded hex escape as UTF-8 in UTF-8 mode.
+/// GNU's `\xHH` (and `\dNNN`/`\oNNN`) is always a byte escape, even in UTF-8 mode: it never
+/// matches a real multi-byte UTF-8 character sharing the same numeric codepoint. `\xE9` (raw
+/// byte 0xE9) leaves a genuine 'é' (U+00E9, encoded as the two bytes 0xC3 0xA9) untouched,
+/// since neither of its bytes is 0xE9 (verified against real GNU sed; see FB-033).
 #[test]
 fn trans_utf8_escape_in_c_utf8_locale() {
     new_ucmd!()
@@ -1127,7 +1162,219 @@ fn trans_utf8_escape_in_c_utf8_locale() {
         .args(&["-e", r"y/\xE9/Z/"])
         .pipe_in("é\n")
         .succeeds()
+        .stdout_is_bytes("é\n".as_bytes());
+}
+
+/// The same byte escape does match a genuine raw 0xE9 byte in the input, in UTF-8 mode, just
+/// as it does in the C locale (see `trans_byte_escape_matches_invalid_input_in_c_locale`).
+#[test]
+fn trans_byte_escape_matches_raw_byte_in_c_utf8_locale() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"y/\xE9/Z/"])
+        .pipe_in(b"\xE9\n".to_vec())
+        .succeeds()
         .stdout_is_bytes(b"Z\n");
+}
+
+/// The same byte escape also matches in `s///`, both in the pattern and (producing the raw
+/// byte back) in the replacement — this is the primary FB-033 case: `\xff` in a script and a
+/// raw byte in the data should match and produce the byte, as GNU does, regardless of locale.
+#[test]
+fn subst_byte_escape_matches_and_produces_raw_byte_in_c_utf8_locale() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/\xff/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/x/\xff/"])
+        .pipe_in(b"x\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"\xff\n");
+}
+
+/// The same byte escape matches and produces the raw byte in ERE mode (`-E`) too, exercising
+/// the other half of `push_pattern_escaped_char`'s `RegexMode`-aware emission.
+#[test]
+fn subst_byte_escape_matches_raw_byte_in_ere_mode() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-E", "-e", r"s/\xff/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
+/// A `\xHH` byte escape above ASCII inside a bracket expression, in UTF-8 mode, matches
+/// nothing at all — verified against the real GNU oracle: `[\xff]` matches neither the raw
+/// byte 0xFF nor the Unicode character U+00FF ('ÿ'). Negated, `[^\xff]` matches any (valid)
+/// character instead, since the empty positive class negates to "everything".
+#[test]
+fn subst_byte_escape_in_bracket_never_matches_in_utf8_mode() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/[\xff]/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"\xff\n");
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-e", r"s/[^\xff]/X/"])
+        .pipe_in(b"a\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
+/// The same escape still matches a raw byte inside a bracket expression in the `C` (byte)
+/// locale, unaffected by the UTF-8-mode-only behavior above.
+#[test]
+fn subst_byte_escape_in_bracket_matches_raw_byte_in_c_locale() {
+    new_ucmd!()
+        .env("LC_ALL", "C")
+        .args(&["-e", r"s/[\xff]/X/"])
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
+/// A raw (non-UTF-8) byte *in the script argument itself* — not a `\xHH` escape, but the
+/// literal byte, as arrives from a shell doing `x=$'\xff'; sed "s/$x/X/"` — also matches the
+/// same raw byte in the data. This needs `script`/`expression` to be `OsString`-valued clap
+/// arguments (not `String`, which would refuse a non-UTF-8 `OsString` outright) and
+/// `ScriptValue::StringVal` to carry `Vec<u8>` rather than `String` end to end.
+#[cfg(unix)]
+#[test]
+fn subst_raw_script_byte_matches_raw_data_byte() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let script = OsString::from_vec(b"s/\xff/X/".to_vec());
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .arg("-e")
+        .arg(script)
+        .pipe_in(b"\xff\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\n");
+}
+
+/// `-z` writes NUL, not `\n`, as the record terminator on output too, not just when reading
+/// input (FB-078/FA-077). Verified against the oracle.
+#[test]
+fn null_data_terminates_output_records_with_nul() {
+    new_ucmd!()
+        .arg("-z")
+        .arg("s/a/X/")
+        .pipe_in(b"a\0b\0".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"X\0b\0");
+}
+
+/// A compile error names its source the way GNU does: `-e expression #N, char C:` (no line
+/// number — GNU counts characters within the one expression, not lines) for both an `-e` and
+/// the first-POSIX-form positional script argument (GNU labels that "-e expression #1" too),
+/// with `N` matching the expression's own 1-based position among every `-e` given. Root cause
+/// was `ScriptLineProvider` resetting to its no-current-source defaults (empty name, line 0)
+/// the instant the source that ran out was itself the one whose exhaustion was the news — by
+/// the time `next_line` returns `None`, `advance_source` has already moved the state past it.
+/// `last_input_name`/`last_line_number` keep the last `Active` source's own location visible
+/// once that happens. Verified against the oracle for the message text on the single/`-e`
+/// forms; the second-`-e` case checks only the format and index (the oracle's own char count
+/// for that exact case wasn't independently reproduced against the same message text yet).
+#[test]
+fn compile_error_location_names_the_e_expression() {
+    new_ucmd!()
+        .args(&["-e", "s/a/b"])
+        .pipe_in("")
+        .fails()
+        .code_is(1)
+        .stderr_contains("sed: -e expression #1, char");
+    new_ucmd!()
+        .arg("s/a/b")
+        .pipe_in("")
+        .fails()
+        .code_is(1)
+        .stderr_contains("sed: -e expression #1, char");
+    new_ucmd!()
+        .args(&["-e", "s/x/y/", "-e", "s/a/b"])
+        .pipe_in("")
+        .fails()
+        .code_is(1)
+        .stderr_contains("sed: -e expression #2, char");
+}
+
+/// `N` reaching end of input on its very first, untouched attempt preserves the final line's
+/// own missing terminator — it does not gain one just because `N` never got a next line to
+/// join it with (FB-078/FA-077). Verified against the oracle.
+#[test]
+fn n_at_true_eof_does_not_add_a_missing_terminator() {
+    new_ucmd!()
+        .arg("N")
+        .pipe_in(b"a".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a");
+    // With a terminator to begin with, one is of course still there.
+    new_ucmd!()
+        .arg("N")
+        .pipe_in(b"a\n".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"a\n");
+}
+
+/// Once `N` has already joined a line, a *later* `N` reaching end of input in the same cycle
+/// (reached through `D`'s restart-without-reading) gets a terminator added regardless of the
+/// actual last line's own — a genuine GNU quirk, verified against the oracle both ways.
+#[test]
+fn n_at_eof_after_d_restart_adds_a_terminator_even_when_the_last_line_lacks_one() {
+    new_ucmd!()
+        .args(&["-e", "N", "-e", "D"])
+        .pipe_in(b"a\nb".to_vec())
+        .succeeds()
+        .stdout_is_bytes(b"b\n");
+}
+
+/// `-s` inserts the record terminator between two file operands when the first one's last
+/// line lacked one, carrying `pending_newline` across `InPlace::begin`'s per-file
+/// `OutputBuffer` (FB-078/FA-077's `-s`-interaction discovery) — `N` reaches true end of
+/// input at the end of *each* separate file, so this is the "N at EOF" case, not a join.
+/// Verified against the oracle.
+#[test]
+#[cfg(unix)]
+fn n_at_eof_terminator_carries_across_file_operands_with_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f1"), b"a").unwrap();
+    std::fs::write(dir.path().join("f2"), b"b").unwrap();
+
+    new_ucmd!()
+        .arg("-s")
+        .arg("N")
+        .arg(dir.path().join("f1"))
+        .arg(dir.path().join("f2"))
+        .succeeds()
+        .stdout_is_bytes(b"a\nb");
+}
+
+/// Without `-s`, two file operands form one continuous stream: `N` reads straight across the
+/// boundary as a real join (not an "N at EOF" case at all, so `f1`'s own missing terminator
+/// is irrelevant — it is `f2`'s line that `N` actually joins with, using the ordinary
+/// delimiter). Verified against the oracle: this happens to look identical to the `-s` case's
+/// output, for an unrelated reason (`f2` and `f1` are only one line long each).
+#[test]
+#[cfg(unix)]
+fn n_joins_across_file_operands_without_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f1"), b"a").unwrap();
+    std::fs::write(dir.path().join("f2"), b"b").unwrap();
+
+    new_ucmd!()
+        .arg("N")
+        .arg(dir.path().join("f1"))
+        .arg(dir.path().join("f2"))
+        .succeeds()
+        .stdout_is_bytes(b"a\nb");
 }
 
 /// Reject raw invalid UTF-8 transliteration script bytes in UTF-8 mode.
@@ -1179,7 +1426,7 @@ fn pattern_clear_with_z_is_non_posix() {
         .args(&["--posix", "z"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:1: error: invalid command code `z'\n");
+        .stderr_is("sed: -e expression #1, char 1: unknown command: `z'\n");
 }
 check_output!(trans_newline, ["-e", r"1N;2y/\n/X/", LINES1]);
 
@@ -1516,7 +1763,7 @@ fn test_branch_no_sub_non_posix() {
         .args(&["--posix", "T"])
         .fails()
         .code_is(1)
-        .stderr_contains("invalid command code");
+        .stderr_contains("unknown command");
 }
 
 ////////////////////////////////////////////////////////////
@@ -1705,7 +1952,7 @@ fn sandbox_rejects_read_command() {
     new_ucmd!()
         .args(&["--sandbox", &format!("1r {LINES2}"), LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 }
 
 #[test]
@@ -1716,7 +1963,7 @@ fn sandbox_rejects_subst_write_flag() -> std::io::Result<()> {
     new_ucmd!()
         .args(&["--sandbox", &cmd, LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 
     let mut actual = String::new();
     temp.reopen()?.read_to_string(&mut actual)?;
@@ -1733,7 +1980,7 @@ fn sandbox_rejects_write_command() -> std::io::Result<()> {
     new_ucmd!()
         .args(&["--sandbox", &cmd, LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 
     let mut actual = String::new();
     temp.reopen()?.read_to_string(&mut actual)?;
@@ -1750,7 +1997,7 @@ fn sandbox_rejects_first_line_write_command() -> std::io::Result<()> {
     new_ucmd!()
         .args(&["--sandbox", &cmd, LINES1])
         .fails()
-        .stderr_contains("command not allowed with --sandbox");
+        .stderr_contains("e/r/w commands disabled in sandbox mode");
 
     let mut actual = String::new();
     temp.reopen()?.read_to_string(&mut actual)?;
@@ -1859,7 +2106,7 @@ fn write_first_line_with_w_command_is_non_posix() {
         .args(&["--posix", "W /tmp/out"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:1: error: invalid command code `W'\n");
+        .stderr_is("sed: -e expression #1, char 1: unknown command: `W'\n");
 }
 
 ////////////////////////////////////////////////////////////
@@ -1891,7 +2138,7 @@ fn filename_non_posix() {
         .args(&["--posix", "F"])
         .fails()
         .code_is(1)
-        .stderr_contains("invalid command code");
+        .stderr_contains("unknown command");
 }
 
 /// List Unicode input under an explicit UTF-8 locale
@@ -1946,6 +2193,51 @@ fn in_place_edit_replace() -> std::io::Result<()> {
     let actual = std::fs::read_to_string(&path)?;
 
     assert_eq!(actual, "hello, universe\n");
+    Ok(())
+}
+
+// FB-020: `-i` over several files must treat each one as its own address stream (as if
+// `-s` were also given), not one continuous stream across all of them — otherwise `1i`
+// only reaches the first file and `$a` only the last.
+#[test]
+fn in_place_edit_addresses_each_file_separately() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, "a1\na2\n")?;
+    std::fs::write(&b, "b1\nb2\n")?;
+
+    new_ucmd!()
+        .args(&["-i", "1i# header", a.to_str().unwrap(), b.to_str().unwrap()])
+        .succeeds();
+    assert_eq!(std::fs::read_to_string(&a)?, "# header\na1\na2\n");
+    assert_eq!(std::fs::read_to_string(&b)?, "# header\nb1\nb2\n");
+
+    std::fs::write(&a, "a1\na2\n")?;
+    std::fs::write(&b, "b1\nb2\n")?;
+    new_ucmd!()
+        .args(&["-i", "$a# footer", a.to_str().unwrap(), b.to_str().unwrap()])
+        .succeeds();
+    assert_eq!(std::fs::read_to_string(&a)?, "a1\na2\n# footer\n");
+    assert_eq!(std::fs::read_to_string(&b)?, "b1\nb2\n# footer\n");
+    Ok(())
+}
+
+#[test]
+// FA-082: an unreadable operand must not stop `-i` from editing the rest of the list — GNU
+// reports it and keeps going, exiting 2 only once every operand has had its turn.
+fn in_place_edit_continues_past_an_unreadable_file() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = dir.path().join("a");
+    let nope = dir.path().join("nope");
+    std::fs::write(&a, "a\n")?;
+
+    let result = new_ucmd!()
+        .args(&["-i", "s/a/z/", nope.to_str().unwrap(), a.to_str().unwrap()])
+        .fails();
+    result.code_is(2);
+    result.stderr_contains(format!("can't read {}", nope.display()));
+    assert_eq!(std::fs::read_to_string(&a)?, "z\n");
     Ok(())
 }
 
@@ -2172,25 +2464,29 @@ fn test_invalid_backreference() {
         .args(&["-n", "-e", r"s/./X/;s//\1/", LINES1])
         .fails()
         .code_is(2)
-        .stderr_is("sed: <script argument 1>:1:8: error: invalid reference \\1 on command's RHS\n");
+        .stderr_is("sed: -e expression #1, char 8: invalid reference \\1 on command's RHS\n");
 }
 
 #[test]
 fn test_duplicate_label() {
+    // GNU doesn't refuse a duplicate label — verified against the oracle.
     new_ucmd!()
         .args(&[":foo;:foo"])
-        .fails()
-        .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:6: error: duplicate label `foo'\n");
+        .pipe_in("a\n")
+        .succeeds()
+        .stdout_is("a\n");
 }
 
 #[test]
 fn test_undefined_label() {
+    // GNU's own wording, status, and lack of a `-e expression #N, char C:` location prefix —
+    // verified against the oracle. An unresolved branch target is a late-binding setup failure
+    // (status 4), not a script syntax error.
     new_ucmd!()
         .args(&["b foo"])
         .fails()
-        .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:1: error: undefined label `foo'\n");
+        .code_is(4)
+        .stderr_is("sed: can't find label for jump to `foo'\n");
 }
 
 #[test]
@@ -2199,7 +2495,7 @@ fn test_incomplete_test_command_posix() {
         .args(&["--posix", "i\\"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: :0:3: error: incomplete command\n");
+        .stderr_is("sed: -e expression #1, char 2: incomplete command\n");
 }
 
 #[test]
@@ -2209,17 +2505,22 @@ fn test_empty_text_commands_fail() {
             .args(&["-e", command])
             .fails()
             .code_is(1)
-            .stderr_contains(format!("command `{command}' expects \\ followed by text"));
+            .stderr_contains("expected \\ after `a', `c' or `i'");
     }
 }
 
 #[test]
 fn test_addr0_non_posix() {
+    // GNU's own wording and location for every misuse of line address 0 is the same generic
+    // "invalid usage of line address 0", including under --posix (which disables the whole
+    // `0,/regexp/` extension, so even an otherwise-valid second regex address still fails) — and
+    // GNU only reports it once the *whole* address construct has been parsed (char 8, right
+    // after `0,/foo/`), not the instant it sees the `0` (char 2) — verified against the oracle.
     new_ucmd!()
         .args(&["--posix", "0,/foo/p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:2: error: address 0 is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 8: invalid usage of line address 0\n");
 }
 
 #[test]
@@ -2228,7 +2529,7 @@ fn test_addr0_second_required() {
         .args(&["0p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:2: error: address 0 can only be used with ~step, a second regular expression, or a read command\n");
+        .stderr_is("sed: -e expression #1, char 2: invalid usage of line address 0\n");
 }
 
 #[test]
@@ -2237,16 +2538,42 @@ fn test_addr0_second_re_only() {
         .args(&["0,4p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:4: error: address 0 can only be used with ~step, a second regular expression, or a read command\n");
+        .stderr_is("sed: -e expression #1, char 4: invalid usage of line address 0\n");
+}
+
+#[test]
+fn test_addr0_step_of_zero_is_still_address_0_misuse() {
+    // `0~N` for a real step N is a legitimate GNU extension (every Nth line), but `0~0` names no
+    // step at all and is address-0 misuse like any other bare `0` address — verified against the
+    // oracle: status 1, char 4 (right after `0~0`).
+    new_ucmd!()
+        .args(&["0~0p"])
+        .fails()
+        .code_is(1)
+        .stderr_is("sed: -e expression #1, char 4: invalid usage of line address 0\n");
+}
+
+#[test]
+fn test_addr0_step_nonzero_is_a_valid_extension() {
+    // The counterpart to the above: `0~2` is not address-0 misuse, and picks every even line,
+    // verified against the oracle.
+    new_ucmd!()
+        .args(&["-n", "0~2p"])
+        .pipe_in("a\nb\nc\nd\n")
+        .succeeds()
+        .stdout_is("b\nd\n");
 }
 
 #[test]
 fn test_step_match_non_posix() {
+    // Under --posix, `~` isn't address syntax at all (not even to report it as a disabled
+    // extension) — it just falls through and reads as the next command, which isn't a real
+    // one — verified against the oracle.
     new_ucmd!()
         .args(&["--posix", "3~2p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:3: error: ~step is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 2: unknown command: `~'\n");
 }
 
 #[test]
@@ -2255,7 +2582,7 @@ fn test_step_end_non_posix() {
         .args(&["--posix", "3,~2p"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:4: error: ~step is invalid in POSIX mode\n");
+        .stderr_is("sed: -e expression #1, char 4: ~step is invalid in POSIX mode\n");
 }
 
 // The following test diverse ways in which regexes are matched.
@@ -2301,12 +2628,53 @@ fn test_fancy_regex_captures_iter_error() {
 }
 
 #[test]
+fn test_unterminated_y_command_matches_gnus_wording() {
+    // Verified against the oracle: an unterminated `y` command gets its own wording, the same
+    // way an unterminated `s` command does, rather than the generic "unterminated transliteration
+    // string" `parse_transliteration_bytes` raises internally.
+    new_ucmd!()
+        .args(&["y/a", LINES1])
+        .fails()
+        .code_is(1)
+        .stderr_is("sed: -e expression #1, char 3: unterminated `y' command\n");
+}
+
+#[test]
+fn test_unterminated_posix_class_in_s_pattern_matches_gnus_wording() {
+    // Verified against the oracle: an unclosed POSIX class inside an `s` pattern is reported as
+    // the same `` unterminated `s' command `` as any other unterminated regex, not a
+    // class-specific message.
+    new_ucmd!()
+        .args(&["s/[[:alpha/x/", LINES1])
+        .fails()
+        .code_is(1)
+        .stderr_is("sed: -e expression #1, char 13: unterminated `s' command\n");
+}
+
+#[test]
 fn test_write_file_failure() {
+    // Status 4 and this bare, unquoted, unprefixed wording, verified against the oracle: a `w`
+    // target that can't be opened is the same "couldn't set up a needed file" family as a
+    // missing `-f` script file, not a script syntax error and not the generic status-2 a `w`
+    // write that starts out fine but later fails would get.
     new_ucmd!()
         .args(&["w /xyzzy/xyzy", LINES1])
         .fails()
-        .code_is(2)
-        .stderr_contains("sed: <script argument 1>:1:1: error: creating file '/xyzzy/xyzy':");
+        .code_is(4)
+        .stderr_is("sed: couldn't open file /xyzzy/xyzy: No such file or directory\n");
+}
+
+#[test]
+fn test_write_file_to_directory_failure() {
+    // A `w` target that names an existing directory, verified against the oracle: same status-4
+    // family and message shape as a `w` target whose parent doesn't exist, just a different
+    // underlying OS reason ("Is a directory" rather than "No such file or directory").
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("a_directory");
+    ucmd.args(&["w a_directory", LINES1])
+        .fails()
+        .code_is(4)
+        .stderr_is("sed: couldn't open file a_directory: Is a directory\n");
 }
 
 #[test]
@@ -2412,7 +2780,7 @@ fn test_expected_newer_version() {
     new_ucmd!()
         .args(&["v4.10"])
         .fails()
-        .stderr_is("sed: <script argument 1>:1:6: error: expected newer version of sed\n");
+        .stderr_is("sed: -e expression #1, char 5: expected newer version of sed\n");
 }
 
 #[test]
@@ -2420,7 +2788,7 @@ fn test_invalid_version() {
     new_ucmd!()
         .args(&["v4.a"])
         .fails()
-        .stderr_is("sed: <script argument 1>:1:5: error: invalid version of sed\n");
+        .stderr_is("sed: -e expression #1, char 4: invalid version of sed\n");
 }
 
 #[test]
@@ -2440,7 +2808,7 @@ fn test_invalid_only_major_version() {
     new_ucmd!()
         .args(&["v999"])
         .fails()
-        .stderr_is("sed: <script argument 1>:1:5: error: invalid version of sed\n");
+        .stderr_is("sed: -e expression #1, char 4: invalid version of sed\n");
 }
 
 #[test]
@@ -2456,11 +2824,175 @@ fn test_posix_reject_flags() {
         .args(&["--posix", "s/a/b/i"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:7: error: unknown option to 's'\n");
+        .stderr_is("sed: -e expression #1, char 7: unknown option to `s'\n");
 
     new_ucmd!()
         .args(&["--posix", "s/a/b/m"])
         .fails()
         .code_is(1)
-        .stderr_is("sed: <script argument 1>:1:7: error: unknown option to 's'\n");
+        .stderr_is("sed: -e expression #1, char 7: unknown option to `s'\n");
+}
+
+// GNU word-boundary escapes are RE assertions, not the C `\b` (backspace) character
+// escape. FB-022/FA-072: `\b`, `\<` and `\>` used to never match.
+#[test]
+fn test_word_boundary_escape() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&[r"s/\bcat\b/dog/g"])
+        .pipe_in("cat catalog cat\n")
+        .succeeds()
+        .stdout_is("dog catalog dog\n");
+}
+
+#[test]
+fn test_word_start_end_escapes() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-E", r"s/\<old_name\>/new_name/g"])
+        .pipe_in("old_name and old_name2\n")
+        .succeeds()
+        .stdout_is("new_name and old_name2\n");
+}
+
+// Byte mode (the plain `C`/`POSIX` locale) can't run the lookaround `\<`/`\>` need,
+// for the same reason it already can't run back-references: fancy_regex requires
+// valid UTF-8 text. It must refuse with a clear error, not silently mismatch.
+#[test]
+fn test_word_start_end_escapes_refuse_in_byte_mode() {
+    new_ucmd!()
+        .env("LC_ALL", "C")
+        .args(&["-E", r"s/\<old_name\>/new_name/"])
+        .pipe_in("old_name\n")
+        .fails()
+        .stderr_contains("not supported in byte mode");
+}
+
+// FB-023: `c` on a two-address range must delete the whole range and print the
+// replacement text exactly once, at the range's last line.
+#[test]
+fn test_change_command_on_line_range() {
+    new_ucmd!()
+        .args(&["2,3c X"])
+        .pipe_in("alpha\nbeta\ngamma\ndelta\n")
+        .succeeds()
+        .stdout_is("alpha\nX\ndelta\n");
+}
+
+#[test]
+fn test_change_command_on_relative_range() {
+    new_ucmd!()
+        .args(&["2,+1c X"])
+        .pipe_in("alpha\nbeta\ngamma\ndelta\n")
+        .succeeds()
+        .stdout_is("alpha\nX\ndelta\n");
+}
+
+// FB-078/FA-077: a bare `l` wraps at the `-l` length (default 70), which is not tied
+// to any controlling terminal width (there is none under WASI).
+#[test]
+fn test_l_command_default_width_is_70() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-n", "l"])
+        .pipe_in(format!("{}\n", "a".repeat(80)))
+        .succeeds()
+        .stdout_is(format!("{}\\\n{}$\n", "a".repeat(69), "a".repeat(11)));
+}
+
+#[test]
+fn test_l_command_honors_dash_l() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["-n", "-l", "10", "l"])
+        .pipe_in("abcdefghij\n")
+        .succeeds()
+        .stdout_is("abcdefghi\\\nj$\n");
+}
+
+// FA-077: `--posix` disables the GNU BRE/ERE extensions `\+`, `\?` and `\|`, so they
+// match as literal characters instead of one-or-more/zero-or-one/alternation.
+#[test]
+fn test_posix_disables_backslash_plus_extension() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&["--posix", r"s/a\+/X/"])
+        .pipe_in("aaa+\n")
+        .succeeds()
+        .stdout_is("aaX\n");
+}
+
+#[test]
+fn test_non_posix_keeps_backslash_plus_extension() {
+    new_ucmd!()
+        .env("LC_ALL", "C.UTF-8")
+        .args(&[r"s/a\+/X/"])
+        .pipe_in("aaa+\n")
+        .succeeds()
+        .stdout_is("X+\n");
+}
+
+// FA-069: nested `{` blocks compile through several native-recursive tree walks with no
+// explicit stack. GNU sed handles thousands of levels of nesting (it doesn't recurse for
+// this at all); a plausible depth must not trap the embedder, and a truly pathological
+// depth must fail cleanly instead.
+#[test]
+fn test_deeply_nested_blocks_compile() {
+    let script = format!("{}p{}", "{".repeat(2000), "}".repeat(2000));
+    new_ucmd!()
+        .args(&[&script])
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("x\nx\n");
+}
+
+// `compile_sequence` parses nesting with its own heap frame stack now (not the native
+// call stack), so several times the depth GNU sed is known to handle — far beyond what
+// any hand-written script would use — compiles and runs cleanly.
+#[test]
+fn test_very_deeply_nested_blocks_compile() {
+    let script = format!("{}p{}", "{".repeat(4_000), "}".repeat(4_000));
+    new_ucmd!()
+        .args(&[&script])
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("x\nx\n");
+}
+
+// Beyond `MAX_BLOCK_NESTING`, compilation refuses cleanly rather than succeeding and
+// later overflowing the stack when the compiled command chain is dropped (`Command`'s
+// `.next`/`.data` links are still freed by the derived, recursive `Drop` glue).
+#[test]
+fn test_pathologically_nested_blocks_are_a_compile_error_not_a_crash() {
+    let script = format!("{}p{}", "{".repeat(200_000), "}".repeat(200_000));
+    new_ucmd!()
+        .args(&[&script])
+        .fails()
+        .stderr_contains("nested too deeply");
+}
+
+// FA-076: GNU's `R` command queues one line from a file per invocation (unlike `r`,
+// which queues the whole file), and a missing file behaves as empty, not an error.
+#[test]
+fn test_r_capital_reads_one_line_per_invocation() -> std::io::Result<()> {
+    let temp = NamedTempFile::new()?;
+    write!(temp.as_file(), "x\ny\nz\n")?;
+    let cmd = format!("R {}", temp.path().display());
+
+    new_ucmd!()
+        .args(&["-e", &cmd])
+        .pipe_in("a\nb\nc\nd\n")
+        .succeeds()
+        .stdout_is("a\nx\nb\ny\nc\nz\nd\n");
+    Ok(())
+}
+
+#[test]
+fn test_r_capital_missing_file_is_silently_empty() {
+    let cmd = "R /nonexistent/does-not-exist-either";
+    new_ucmd!()
+        .args(&["-e", cmd])
+        .pipe_in("a\nb\n")
+        .succeeds()
+        .stdout_is("a\nb\n");
 }

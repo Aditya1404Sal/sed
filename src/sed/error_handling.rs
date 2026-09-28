@@ -40,9 +40,29 @@ impl ScriptLocation {
     pub fn at_position(lines: &ScriptLineProvider, line: &ScriptCharProvider) -> Self {
         ScriptLocation {
             line_number: lines.get_line_number(),
-            column_number: line.get_pos() + 1,
+            column_number: char_column(line),
             input_name: Rc::from(lines.get_input_name()),
         }
+    }
+}
+
+/// GNU's own location prefix for a diagnostic tied to a specific point in the script source,
+/// without the trailing `: ` before the message text — verified against the oracle:
+/// `-e expression #1, char 5: unterminated `s' command` for the first `-e` (or the
+/// first-POSIX-form positional script argument, which GNU labels the same way), or
+/// `-e expression #2, char 4: ...` for a later `-e`, each with its own 1-based char column
+/// (not a running total across `-e`s, and no line number at all — GNU only counts characters
+/// within the one expression). `input_name` here is `ScriptLineProvider::get_input_name`'s own
+/// `<script argument N>` marker (`advance_source`, `script_line_provider.rs`) for exactly this
+/// case; anything else (a `-f` script file) falls back to the pre-existing, generic
+/// `name:line:col: error` form, since GNU's own file-sourced wording hasn't been verified here.
+pub(crate) fn location_prefix(input_name: &str, line_number: usize, column: usize) -> String {
+    match input_name
+        .strip_prefix("<script argument ")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        Some(index) => format!("-e expression #{index}, char {column}"),
+        None => format!("{input_name}:{line_number}:{column}: error"),
     }
 }
 
@@ -56,13 +76,27 @@ pub fn compilation_error<T>(
     Err(USimpleError::new(
         1,
         format!(
-            "{}:{}:{}: error: {}",
-            lines.get_input_name(),
-            lines.get_line_number(),
-            line.get_pos() + 1,
+            "{}: {}",
+            location_prefix(
+                lines.get_input_name(),
+                lines.get_line_number(),
+                char_column(line)
+            ),
             msg.to_string()
         ),
     ))
+}
+
+/// The 1-based column `compilation_error`/`location_error` report: `line.get_pos() + 1`
+/// (the position of the character about to be read) everywhere except at end of line, where
+/// GNU's own column never runs past the line's own length — verified against the oracle
+/// (`sed 's/a/b'`, 5 characters, error `char 5`, not `char 6`).
+fn char_column(line: &ScriptCharProvider) -> usize {
+    if line.eol() {
+        line.get_pos()
+    } else {
+        line.get_pos() + 1
+    }
 }
 
 /// Fail with msg as a compilation error at the command's location.
@@ -71,10 +105,12 @@ fn location_error<T>(location: &ScriptLocation, msg: impl ToString, exit_code: i
     Err(USimpleError::new(
         exit_code,
         format!(
-            "{}:{}:{}: error: {}",
-            location.input_name,
-            location.line_number,
-            location.column_number,
+            "{}: {}",
+            location_prefix(
+                &location.input_name,
+                location.line_number,
+                location.column_number,
+            ),
             msg.to_string()
         ),
     ))
@@ -114,4 +150,30 @@ pub fn input_runtime_error<T>(
             msg.to_string()
         ),
     ))
+}
+
+/// Replace a `compilation_error`'s own generic message with a context-specific one, keeping
+/// its location prefix and exit code — used where `parse_regex_for_mode`/`parse_character_class`/
+/// `parse_transliteration_bytes` raise the same generic "unterminated ..." message whether they
+/// were called for a command address, an `s` command's pattern, or a `y` command's operand, but
+/// GNU's own wording for hitting end of input differs by which one it was (verified against the
+/// oracle: `sed '/unterminated'` -> "unterminated address regex", `sed 's/a'` -> `` unterminated
+/// `s' command ``, `sed 'y/a'` -> `` unterminated `y' command ``, `sed 's/[[:alpha/x/'` (an
+/// unclosed POSIX class inside an `s` pattern) -> the same `` unterminated `s' command `` as any
+/// other unterminated regex, not a class-specific message).
+pub fn remap_unterminated<T>(result: UResult<T>, replacement: &str) -> UResult<T> {
+    result.map_err(|error| {
+        let message = error.to_string();
+        for generic in [
+            "unterminated regular expression",
+            "Unterminated bracket expression",
+            "unterminated transliteration string",
+            "Unterminated POSIX character class, equivalence or collating symbol",
+        ] {
+            if let Some(prefix) = message.strip_suffix(generic) {
+                return USimpleError::new(1, format!("{prefix}{replacement}"));
+            }
+        }
+        error
+    })
 }

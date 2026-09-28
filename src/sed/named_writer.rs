@@ -28,26 +28,48 @@ thread_local! {
 /// Writer that tracks its file name for better error messages
 pub struct NamedWriter {
     pub path: PathBuf,
-    writer: BufWriter<File>,
+    /// `None` for `/dev/stdout`, which, as in GNU sed, is sed's own output rather than a file.
+    writer: Option<BufWriter<File>>,
     location: ScriptLocation,
 }
 
 impl NamedWriter {
     /// Create a new writer, truncate the file, and register it for flushing.
     pub fn new(path: PathBuf, location: ScriptLocation) -> UResult<Rc<RefCell<Self>>> {
+        if path.as_os_str() == "/dev/stdout" {
+            return Ok(Rc::new(RefCell::new(NamedWriter {
+                path,
+                writer: None,
+                location,
+            })));
+        }
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&path)
             .map_err(|e| {
-                runtime_error::<()>(&location, format!("creating file {}: {}", path.quote(), e))
-                    .unwrap_err()
+                // GNU's own wording and exit status for failing to open a `w`/`W` target,
+                // verified against the oracle (`sed 'w /tmp/d'` where `/tmp/d` is a directory ->
+                // "couldn't open file /tmp/d: Is a directory", status 4, with the path bare
+                // (unquoted, even with a space in it) and no `-e expression #N` location prefix
+                // at all — the same status-4 "couldn't set up a needed file" family as a missing
+                // `-f` script file, not the generic status-2 `runtime_error` a `w` write that
+                // starts out fine but later fails (a full disk, say) would get. `io::Error`'s own
+                // `Display` appends a "(os error N)" suffix under wasm32-wasip2 that GNU's own
+                // message never has, so it's stripped the same way `script_line_provider.rs`'s
+                // `-f`-file-open path already does.
+                let text = e.to_string();
+                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                uucore::error::USimpleError::new(
+                    4,
+                    format!("couldn't open file {}: {text}", path.display()),
+                )
             })?;
 
         let writer = Rc::new(RefCell::new(NamedWriter {
             path,
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
             location,
         }));
 
@@ -60,13 +82,21 @@ impl NamedWriter {
         self.write_line_bytes(line.as_bytes(), newline)
     }
 
+    /// Whether this writes to sed's own output (`/dev/stdout`), which the caller then does.
+    pub fn is_standard_output(&self) -> bool {
+        self.writer.is_none()
+    }
+
     /// Write bytes to the file, possibly with a newline, returning errors.
     pub fn write_line_bytes(&mut self, line: &[u8], newline: bool) -> UResult<()> {
-        self.writer
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        writer
             .write_all(line)
             .and_then(|()| {
                 if newline {
-                    self.writer.write_all(b"\n")
+                    writer.write_all(b"\n")
                 } else {
                     Ok(())
                 }
@@ -82,7 +112,10 @@ impl NamedWriter {
 
     /// Flush the writer, returning a descriptive error.
     pub fn flush(&mut self) -> UResult<()> {
-        self.writer.flush().map_err(|e| {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        writer.flush().map_err(|e| {
             runtime_error::<()>(
                 &self.location,
                 format!("writing to file {}: {}", self.path.quote(), e),

@@ -26,8 +26,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::rc::Rc;
-use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult, set_exit_code};
+use uucore::error::{UResult, USimpleError, set_exit_code};
 
 /// Return the specified command variant or panic.
 // Example: let path = extract_variant!(command, Path);
@@ -106,23 +105,40 @@ fn applies(
         // No address
         Ok(true)
     } else if let Some(addr2) = &command.addr2 {
-        // Two addresses
+        // Two addresses. Reset the shared "did this call end a range" flag so a stale
+        // `true` from a different two-address command's range end earlier in the script
+        // can't leak into this command's decision (e.g. whether `c` prints on this line).
+        context.last_address = false;
         if let Some(start) = command.start_line {
             // Range is already latched active.
             match addr2 {
                 Address::RelLine(n) => {
-                    if linenum - start > *n {
+                    let end = start + *n;
+                    if linenum >= end {
                         command.start_line = None;
-                        Ok(false)
+                        if linenum == end {
+                            context.last_address = true;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
                     } else {
                         Ok(true)
                     }
                 }
                 Address::Line(n) => {
-                    // Special case: already ended
-                    if linenum > *n {
+                    // The range's terminal line: latch off and flag it as the
+                    // range's last address so a single-shot command (like `c`)
+                    // fires on this line, not one line too late.
+                    if linenum >= *n {
                         command.start_line = None;
-                        Ok(false)
+                        if linenum == *n {
+                            context.last_address = true;
+                            Ok(true)
+                        } else {
+                            // Special case: already ended
+                            Ok(false)
+                        }
                     } else {
                         Ok(true)
                     }
@@ -132,6 +148,7 @@ fn applies(
                     // Inclusive end on multiple of step
                     if linenum.is_multiple_of(*step) {
                         command.start_line = None;
+                        context.last_address = true;
                     }
                     Ok(true)
                 }
@@ -425,14 +442,31 @@ fn substitute(
 
         // Write to file if needed.
         if let Some(ref writer) = sub.write_file {
-            writer
-                .borrow_mut()
-                .write_line_bytes(pattern.as_bytes(), pattern.is_newline_terminated())?;
+            write_named(
+                writer,
+                output,
+                pattern.as_bytes(),
+                pattern.is_newline_terminated(),
+            )?;
         }
         context.substitution_made = true;
     }
 
     Ok(())
+}
+
+/// Writes a `w` line to its file or, for `/dev/stdout`, to sed's own output as GNU sed does.
+fn write_named(
+    writer: &RefCell<crate::sed::named_writer::NamedWriter>,
+    output: &mut OutputBuffer,
+    line: &[u8],
+    newline: bool,
+) -> UResult<()> {
+    if writer.borrow().is_standard_output() {
+        output.write_chunk(&IOChunk::from_bytes(line.to_vec(), newline))?;
+        return Ok(());
+    }
+    writer.borrow_mut().write_line_bytes(line, newline)
 }
 
 /// Apply the specified transliteration in the provided pattern space.
@@ -688,12 +722,16 @@ fn process_file(
     if context.separate
         && !context.quiet
         && let Some(InputAction {
-            prepend: Some(mut pending),
+            prepend: Some(pending),
+            terminated,
             ..
         }) = context.input_action.take()
     {
-        pending.push(b'\n');
-        output.write_bytes(&pending)?;
+        // Preserve the input's own "last line has no terminator" property (FB-078/FA-077):
+        // `write_chunk` (not `write_bytes`, which sniffs `bytes.ends_with(b"\n")` — wrong for
+        // `-z`, and would not see a terminator this code appended itself anyway) only adds
+        // one back if the line `N` read it from actually had one.
+        output.write_chunk(&IOChunk::from_bytes(pending, terminated))?;
         if context.unbuffered {
             output.flush()?;
         }
@@ -716,12 +754,23 @@ pub fn process_line(
     {
         context.line_number += 1;
         context.substitution_made = false;
+        // Whether this call is continuing a pending `n`/`N` from an earlier call, rather than
+        // starting a fresh cycle on a just-read line. `N`'s own EOF fallback (further down,
+        // and in `Engine::finish`/`process_all_files`'s "N command remains" handling) uses
+        // this: verified against the oracle, GNU only preserves a truly-final, unterminated
+        // input line's own missing newline when `N` reaches end of input on its very first,
+        // untouched attempt (`printf 'a' | sed 'N'` → no added newline). Once `N` has already
+        // joined a line once, a *later* `N` hitting end of input in the same cycle — reached
+        // through `D`'s restart-without-reading, in every case checked — gets one added
+        // regardless of the actual last line's own terminator (`printf 'a\nb' | sed 'N;D'` →
+        // `b\n`, even though `b` itself has no newline in the input).
+        let started_as_continuation = context.input_action.is_some();
         // Set the script command from which to start.
         let mut current: Option<Rc<RefCell<Command>>> =
             if let Some(action) = context.input_action.take() {
                 if let Some(mut combined_lines) = action.prepend {
                     // Continue processing the `N` command.
-                    combined_lines.push(b'\n');
+                    combined_lines.push(if context.null_data { b'\0' } else { b'\n' });
                     combined_lines.extend_from_slice(pattern.as_bytes());
                     pattern.set_to_bytes(combined_lines, pattern.is_newline_terminated());
                 }
@@ -857,6 +906,8 @@ pub fn process_line(
                     context.input_action = Some(InputAction {
                         next_command: command.next.clone(),
                         prepend: None,
+                        // Unused for `n` (`prepend: None`): nothing reads it.
+                        terminated: false,
                     });
                     return Ok(());
                 }
@@ -868,6 +919,8 @@ pub fn process_line(
                     // to perform when the next line is read.
                     context.input_action = Some(InputAction {
                         next_command: command.next.clone(),
+                        // See `started_as_continuation`'s own comment above.
+                        terminated: pattern.is_newline_terminated() || started_as_continuation,
                         prepend: Some(pattern.as_bytes().to_vec()),
                     });
                     return Ok(());
@@ -909,6 +962,17 @@ pub fn process_line(
                         .append_elements
                         .push(AppendElement::Path(path.clone()));
                 }
+                'R' => {
+                    // Queue one more line from the file at a later point. A read error
+                    // (the file vanishing mid-run, say) is treated the same as running out
+                    // of lines: nothing is queued, same as GNU sed's "missing file" case.
+                    let reader = extract_variant!(command, NamedReader);
+                    if let Ok(Some(line)) = reader.borrow_mut().next_line() {
+                        context
+                            .append_elements
+                            .push(AppendElement::Text(line.into()));
+                    }
+                }
                 's' => {
                     substitute(&mut pattern, &command, context, output)?;
                 }
@@ -946,9 +1010,12 @@ pub fn process_line(
                 'w' => {
                     // Append the pattern space to the specified file.
                     let writer = extract_variant!(command, NamedWriter);
-                    writer
-                        .borrow_mut()
-                        .write_line_bytes(pattern.as_bytes(), pattern.is_newline_terminated())?;
+                    write_named(
+                        writer,
+                        output,
+                        pattern.as_bytes(),
+                        pattern.is_newline_terminated(),
+                    )?;
                 }
                 'W' => {
                     // Append only the first line of the pattern space.
@@ -960,7 +1027,9 @@ pub fn process_line(
                             Some(pos) => (&pattern_bytes[..=pos], true),
                             None => (pattern_bytes, false),
                         };
-                    writer.borrow_mut().write_line_bytes(
+                    write_named(
+                        writer,
+                        output,
                         first_line,
                         !found_newline && pattern.is_newline_terminated(),
                     )?;
@@ -985,8 +1054,22 @@ pub fn process_line(
                     let (pat_content, _) = pattern.fields_mut()?;
                     pat_content.clear();
                 }
+                'L' => {
+                    // GNU still compiles 'L' (an obsolete line-wrapping command) but removed its
+                    // implementation long ago; actually reaching it fails with GNU's own bare
+                    // internal-error text — no location prefix, unlike every other error here —
+                    // verified against the oracle (`sed '1,2L'` on real input: status 4,
+                    // "sed: INTERNAL ERROR: Bad cmd L").
+                    return Err(USimpleError::new(
+                        4,
+                        "INTERNAL ERROR: Bad cmd L".to_string(),
+                    ));
+                }
                 ':' => {
                     // Branch target; do nothing.
+                }
+                'v' => {
+                    // GNU's version requirement; checked when compiled, a no-op when run.
                 }
                 '=' => {
                     // Output current line number.
@@ -1036,8 +1119,23 @@ pub fn process_all_files(
 
     for (index, path) in files.into_iter().enumerate() {
         context.last_file = index == last_file_index;
-        let mut reader = LineReader::open(&path)
-            .map_err_context(|| format!("error opening input file {}", path.quote()))?;
+        // FA-082: GNU reports an unreadable file and keeps going — the remaining operands
+        // still get edited — rather than stopping the whole `-i`/`-s` run at the first one,
+        // which is what letting this propagate via `?` did (and left every later file
+        // untouched). Verified against the oracle: `sed -i 's/a/z/' nope a` reports
+        // `sed: can't read nope: No such file or directory`, edits `a`, and exits 2.
+        let mut reader = match LineReader::open(&path) {
+            Ok(reader) => reader,
+            Err(error) => {
+                // Under wasm32-wasip2, `io::Error`'s own `Display` appends a
+                // "(os error N)" suffix GNU's own message never has.
+                let text = error.to_string();
+                let text = text.find(" (os error ").map_or(&*text, |i| &text[..i]);
+                eprintln!("sed: can't read {}: {text}", path.display());
+                set_exit_code(2);
+                continue;
+            }
+        };
         let output = in_place.begin(&path)?;
 
         if context.separate || index == 0 {
@@ -1057,12 +1155,14 @@ pub fn process_all_files(
             && !context.separate
             && !context.quiet
             && let Some(InputAction {
-                prepend: Some(mut pending),
+                prepend: Some(pending),
+                terminated,
                 ..
             }) = context.input_action.take()
         {
-            pending.push(b'\n');
-            output.write_bytes(&pending)?;
+            // See the `context.separate` branch above for why `write_chunk`, not
+            // `write_bytes`, and why `terminated` rather than always appending one.
+            output.write_chunk(&IOChunk::from_bytes(pending, terminated))?;
         }
 
         in_place.end()?;

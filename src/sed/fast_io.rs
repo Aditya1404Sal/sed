@@ -600,6 +600,10 @@ pub struct OutputBuffer {
     // True when the last write didn't end with \n; the \n is deferred so
     // that commands like `p` don't emit a spurious newline under -n.
     pending_newline: bool,
+    // The record terminator to write: NUL with `-z`, else newline. Every writer defaults to
+    // `\n` at construction (matching every existing constructor before this field was added);
+    // `set_delimiter` switches it once the caller knows `-z` was given (`context.null_data`).
+    delimiter: u8,
     #[cfg(test)]
     low_level_flushes: usize, // Number of system call flushes
 }
@@ -633,6 +637,7 @@ impl OutputBuffer {
         Self {
             out: BufWriter::new(w),
             pending_newline: false,
+            delimiter: b'\n',
             #[cfg(test)]
             low_level_flushes: 0,
         }
@@ -654,6 +659,7 @@ impl OutputBuffer {
             #[cfg(unix)]
             mmap_chunk: None,
             pending_newline: false,
+            delimiter: b'\n',
             #[cfg(test)]
             low_level_flushes: 0,
         }
@@ -673,9 +679,16 @@ impl OutputBuffer {
             max_pending_write,
             mmap_chunk: None,
             pending_newline: false,
+            delimiter: b'\n',
             #[cfg(test)]
             low_level_flushes: 0,
         }
+    }
+
+    /// The record terminator to write instead of `\n` — NUL with `-z`. Call once, right
+    /// after construction, before anything is written.
+    pub fn set_delimiter(&mut self, delimiter: u8) {
+        self.delimiter = delimiter;
     }
 
     /// Schedule the specified String or &str for eventual output
@@ -753,7 +766,7 @@ impl OutputBuffer {
 
         if self.pending_newline {
             self.flush_mmap(WriteRange::Complete)?;
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.delimiter])?;
             self.pending_newline = false;
         }
 
@@ -813,7 +826,7 @@ impl OutputBuffer {
                 self.flush_mmap(WriteRange::Complete)?;
                 self.out.write_all(content)?;
                 if *has_newline {
-                    self.out.write_all(b"\n")?;
+                    self.out.write_all(&[self.delimiter])?;
                 }
                 self.pending_newline = !has_newline;
             }
@@ -868,7 +881,7 @@ impl OutputBuffer {
     pub fn flush_pending_newline(&mut self) -> io::Result<()> {
         if self.pending_newline {
             self.flush_mmap(WriteRange::Complete)?;
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.delimiter])?;
             self.pending_newline = false;
         }
         Ok(())
@@ -890,7 +903,7 @@ impl OutputBuffer {
         }
 
         if self.pending_newline {
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.delimiter])?;
             self.pending_newline = false;
         }
 
@@ -902,7 +915,7 @@ impl OutputBuffer {
             } => {
                 self.out.write_all(content)?;
                 if *has_newline {
-                    self.out.write_all(b"\n")?;
+                    self.out.write_all(&[self.delimiter])?;
                 }
                 self.pending_newline = !has_newline;
                 Ok(())
@@ -913,7 +926,7 @@ impl OutputBuffer {
     /// Write a deferred newline if the last output didn't end with one.
     pub fn flush_pending_newline(&mut self) -> io::Result<()> {
         if self.pending_newline {
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.delimiter])?;
             self.pending_newline = false;
         }
         Ok(())
@@ -2003,6 +2016,7 @@ mod tests {
             #[cfg(unix)]
             mmap_chunk: None,
             pending_newline: false,
+            delimiter: b'\n',
             low_level_flushes: 0,
         };
         (buf, file)
